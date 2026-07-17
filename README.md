@@ -1,26 +1,31 @@
-# GETAC ERP v0.3
+# GETAC ERP v0.4 — Dashboard
 
-Esta versión agrega la primera sincronización real de ventas de Mercado Libre.
+Incluye un dashboard web compatible con Mac, iPhone y cualquier navegador.
 
-## Nuevas tablas
+## Dashboard
 
-- `orders`
-- `order_items`
-- `payments`
+- `GET /dashboard`
 
-## Rutas
+## API del dashboard
 
-- `GET /health/database`
+- `GET /api/dashboard/summary?days=30`
+
+## Indicadores incluidos
+
+- Ventas acumuladas
+- Órdenes
+- Unidades
+- Ticket promedio
+- Ventas del día
+- Gráfica diaria
+- Estatus de órdenes
+- Top 10 SKUs
+
+## Sincronización
+
 - `POST /sync/mercadolibre/orders?days=30&max_orders=1000`
-- `GET /reports/mercadolibre/summary?days=30`
-- `GET /docs`
 
-## Ejecutar la primera sincronización
+## Nota
 
-1. Abre `/docs`.
-2. Busca `POST /sync/mercadolibre/orders`.
-3. Presiona **Try it out**.
-4. Usa `days=30` y `max_orders=1000`.
-5. Presiona **Execute**.
-
-La aplicación renueva automáticamente el access token cuando sea necesario y guarda el nuevo refresh token.
+Esta versión corrige el cálculo de venta total para evitar duplicar el importe de una orden
+cuando contiene más de un artículo.

@@ -6,7 +6,7 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -686,3 +686,484 @@ async def mercadolibre_webhook(request: Request) -> JSONResponse:
             print({"webhook_database_error": str(exc)})
 
     return JSONResponse(status_code=200, content={"status": "received"})
+@app.get("/api/dashboard/summary")
+def dashboard_summary(days: int = Query(default=30, ge=1, le=365)) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(status_code=500, content={"error": "database_not_configured"})
+
+    now = utcnow()
+    since = now - timedelta(days=days)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+
+    with SessionLocal() as session:
+        totals = session.execute(
+            text(
+                """
+                WITH filtered_orders AS (
+                    SELECT
+                        id,
+                        external_order_id,
+                        paid_amount,
+                        date_created,
+                        status
+                    FROM orders
+                    WHERE marketplace = 'MERCADO_LIBRE'
+                      AND date_created >= :since
+                ),
+                item_totals AS (
+                    SELECT
+                        order_id,
+                        COALESCE(SUM(quantity), 0) AS units
+                    FROM order_items
+                    GROUP BY order_id
+                )
+                SELECT
+                    COUNT(*) AS orders,
+                    COALESCE(SUM(fo.paid_amount), 0) AS paid_amount,
+                    COALESCE(SUM(it.units), 0) AS units,
+                    COALESCE(AVG(fo.paid_amount), 0) AS average_ticket,
+                    COUNT(*) FILTER (
+                        WHERE fo.status IN ('cancelled', 'invalid')
+                    ) AS cancelled_orders
+                FROM filtered_orders fo
+                LEFT JOIN item_totals it ON it.order_id = fo.id
+                """
+            ),
+            {"since": since},
+        ).mappings().one()
+
+        today = session.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*) AS orders,
+                    COALESCE(SUM(paid_amount), 0) AS paid_amount
+                FROM orders
+                WHERE marketplace = 'MERCADO_LIBRE'
+                  AND date_created >= :today_start
+                """
+            ),
+            {"today_start": today_start},
+        ).mappings().one()
+
+        yesterday = session.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*) AS orders,
+                    COALESCE(SUM(paid_amount), 0) AS paid_amount
+                FROM orders
+                WHERE marketplace = 'MERCADO_LIBRE'
+                  AND date_created >= :yesterday_start
+                  AND date_created < :today_start
+                """
+            ),
+            {
+                "yesterday_start": yesterday_start,
+                "today_start": today_start,
+            },
+        ).mappings().one()
+
+        daily_rows = session.execute(
+            text(
+                """
+                SELECT
+                    DATE(date_created AT TIME ZONE 'America/Mexico_City') AS sale_date,
+                    COUNT(*) AS orders,
+                    COALESCE(SUM(paid_amount), 0) AS paid_amount
+                FROM orders
+                WHERE marketplace = 'MERCADO_LIBRE'
+                  AND date_created >= :since
+                GROUP BY 1
+                ORDER BY 1
+                """
+            ),
+            {"since": since},
+        ).mappings().all()
+
+        top_skus = session.execute(
+            text(
+                """
+                SELECT
+                    COALESCE(NULLIF(oi.seller_sku, ''), 'SIN SKU') AS sku,
+                    MAX(oi.title) AS title,
+                    COALESCE(SUM(oi.quantity), 0) AS units,
+                    COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS gross_sales
+                FROM order_items oi
+                JOIN orders o ON o.id = oi.order_id
+                WHERE o.marketplace = 'MERCADO_LIBRE'
+                  AND o.date_created >= :since
+                  AND COALESCE(o.status, '') NOT IN ('cancelled', 'invalid')
+                GROUP BY 1
+                ORDER BY units DESC, gross_sales DESC
+                LIMIT 10
+                """
+            ),
+            {"since": since},
+        ).mappings().all()
+
+        status_rows = session.execute(
+            text(
+                """
+                SELECT
+                    COALESCE(status, 'unknown') AS status,
+                    COUNT(*) AS orders
+                FROM orders
+                WHERE marketplace = 'MERCADO_LIBRE'
+                  AND date_created >= :since
+                GROUP BY 1
+                ORDER BY orders DESC
+                """
+            ),
+            {"since": since},
+        ).mappings().all()
+
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "period_days": days,
+            "generated_at": now.isoformat(),
+            "metrics": {
+                "orders": int(totals["orders"] or 0),
+                "units": int(totals["units"] or 0),
+                "paid_amount": float(totals["paid_amount"] or 0),
+                "average_ticket": float(totals["average_ticket"] or 0),
+                "cancelled_orders": int(totals["cancelled_orders"] or 0),
+                "today_orders": int(today["orders"] or 0),
+                "today_paid_amount": float(today["paid_amount"] or 0),
+                "yesterday_orders": int(yesterday["orders"] or 0),
+                "yesterday_paid_amount": float(yesterday["paid_amount"] or 0),
+            },
+            "daily_sales": [
+                {
+                    "date": str(row["sale_date"]),
+                    "orders": int(row["orders"] or 0),
+                    "paid_amount": float(row["paid_amount"] or 0),
+                }
+                for row in daily_rows
+            ],
+            "top_skus": [
+                {
+                    "sku": row["sku"],
+                    "title": row["title"],
+                    "units": int(row["units"] or 0),
+                    "gross_sales": float(row["gross_sales"] or 0),
+                }
+                for row in top_skus
+            ],
+            "order_statuses": [
+                {
+                    "status": row["status"],
+                    "orders": int(row["orders"] or 0),
+                }
+                for row in status_rows
+            ],
+        }
+    )
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard() -> HTMLResponse:
+    html = r"""
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GETAC ERP — Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --text: #17202a;
+      --muted: #667085;
+      --border: #e6eaf0;
+      --accent: #111827;
+      --good: #16875d;
+      --danger: #c73535;
+      --shadow: 0 10px 30px rgba(16,24,40,.07);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+    }
+    .layout { display: grid; grid-template-columns: 230px 1fr; min-height: 100vh; }
+    .sidebar {
+      background: #111827;
+      color: white;
+      padding: 28px 20px;
+    }
+    .brand { font-size: 22px; font-weight: 800; letter-spacing: .08em; }
+    .brand small { display:block; font-size:11px; font-weight:600; opacity:.55; margin-top:4px; }
+    .nav { margin-top: 32px; display: grid; gap: 8px; }
+    .nav a {
+      color: rgba(255,255,255,.72);
+      text-decoration:none;
+      padding:12px 14px;
+      border-radius:10px;
+      font-size:14px;
+    }
+    .nav a.active { background:rgba(255,255,255,.12); color:white; font-weight:700; }
+    .main { padding: 28px; overflow: hidden; }
+    .topbar {
+      display:flex; justify-content:space-between; align-items:center;
+      margin-bottom:24px; gap:16px;
+    }
+    h1 { margin:0; font-size:28px; }
+    .subtitle { color:var(--muted); margin-top:5px; font-size:14px; }
+    .controls { display:flex; gap:10px; }
+    select, button {
+      border:1px solid var(--border); background:white; padding:10px 12px;
+      border-radius:10px; font-size:14px;
+    }
+    button { cursor:pointer; font-weight:700; }
+    .cards {
+      display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px;
+      margin-bottom:16px;
+    }
+    .card, .panel {
+      background:var(--panel); border:1px solid var(--border); border-radius:16px;
+      box-shadow:var(--shadow);
+    }
+    .card { padding:18px; }
+    .card .label { color:var(--muted); font-size:13px; }
+    .card .value { font-size:27px; font-weight:800; margin-top:8px; }
+    .card .foot { margin-top:8px; color:var(--muted); font-size:12px; }
+    .grid {
+      display:grid; grid-template-columns:minmax(0,2fr) minmax(300px,1fr);
+      gap:16px; margin-bottom:16px;
+    }
+    .panel { padding:20px; min-width:0; }
+    .panel h2 { font-size:16px; margin:0 0 16px; }
+    .chart-wrap { height:310px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th,td { padding:12px 8px; border-bottom:1px solid var(--border); text-align:left; }
+    th { color:var(--muted); font-weight:700; }
+    td.num, th.num { text-align:right; }
+    .sku-title { max-width:300px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .loading {
+      position:fixed; inset:0; background:rgba(244,246,248,.82); display:flex;
+      align-items:center; justify-content:center; font-weight:800; z-index:20;
+    }
+    .error {
+      display:none; background:#fff1f1; color:#9c2323; border:1px solid #ffd1d1;
+      padding:12px 14px; border-radius:10px; margin-bottom:16px;
+    }
+    @media(max-width:1000px){
+      .layout{grid-template-columns:1fr}
+      .sidebar{display:none}
+      .cards{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .grid{grid-template-columns:1fr}
+    }
+    @media(max-width:600px){
+      .main{padding:16px}
+      .cards{grid-template-columns:1fr}
+      .topbar{align-items:flex-start; flex-direction:column}
+    }
+  </style>
+</head>
+<body>
+<div id="loading" class="loading">Cargando dashboard…</div>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">GETAC <small>ERP & ANALYTICS</small></div>
+    <nav class="nav">
+      <a class="active" href="/dashboard">Dashboard</a>
+      <a href="/docs">API y sincronización</a>
+      <a href="/reports/mercadolibre/summary?days=30">Resumen JSON</a>
+    </nav>
+  </aside>
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <h1>Dashboard de ventas</h1>
+        <div class="subtitle">Mercado Libre · Cuenta GETAC</div>
+      </div>
+      <div class="controls">
+        <select id="days">
+          <option value="7">Últimos 7 días</option>
+          <option value="30" selected>Últimos 30 días</option>
+          <option value="90">Últimos 90 días</option>
+          <option value="365">Últimos 365 días</option>
+        </select>
+        <button onclick="loadDashboard()">Actualizar</button>
+      </div>
+    </div>
+
+    <div id="error" class="error"></div>
+
+    <section class="cards">
+      <div class="card">
+        <div class="label">Ventas del periodo</div>
+        <div id="paidAmount" class="value">$0</div>
+        <div id="periodLabel" class="foot">Últimos 30 días</div>
+      </div>
+      <div class="card">
+        <div class="label">Órdenes</div>
+        <div id="orders" class="value">0</div>
+        <div id="averageTicket" class="foot">Ticket promedio: $0</div>
+      </div>
+      <div class="card">
+        <div class="label">Unidades</div>
+        <div id="units" class="value">0</div>
+        <div id="unitsPerOrder" class="foot">0 por orden</div>
+      </div>
+      <div class="card">
+        <div class="label">Ventas hoy</div>
+        <div id="todaySales" class="value">$0</div>
+        <div id="todayOrders" class="foot">0 órdenes</div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <h2>Ventas diarias</h2>
+        <div class="chart-wrap"><canvas id="salesChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h2>Estatus de las órdenes</h2>
+        <div class="chart-wrap"><canvas id="statusChart"></canvas></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Top 10 SKUs por unidades</h2>
+      <div style="overflow:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>SKU</th>
+              <th>Producto</th>
+              <th class="num">Unidades</th>
+              <th class="num">Venta bruta</th>
+            </tr>
+          </thead>
+          <tbody id="topSkuBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+let salesChart;
+let statusChart;
+
+const money = new Intl.NumberFormat('es-MX', {
+  style: 'currency', currency: 'MXN', maximumFractionDigits: 2
+});
+const integer = new Intl.NumberFormat('es-MX');
+
+function showError(message) {
+  const box = document.getElementById('error');
+  box.textContent = message;
+  box.style.display = 'block';
+}
+
+async function loadDashboard() {
+  document.getElementById('loading').style.display = 'flex';
+  document.getElementById('error').style.display = 'none';
+  const days = document.getElementById('days').value;
+
+  try {
+    const response = await fetch(`/api/dashboard/summary?days=${days}`, {cache:'no-store'});
+    if (!response.ok) throw new Error(`Error ${response.status}`);
+    const data = await response.json();
+    const m = data.metrics;
+
+    document.getElementById('paidAmount').textContent = money.format(m.paid_amount);
+    document.getElementById('orders').textContent = integer.format(m.orders);
+    document.getElementById('units').textContent = integer.format(m.units);
+    document.getElementById('averageTicket').textContent =
+      `Ticket promedio: ${money.format(m.average_ticket)}`;
+    document.getElementById('unitsPerOrder').textContent =
+      `${m.orders ? (m.units / m.orders).toFixed(2) : '0'} por orden`;
+    document.getElementById('todaySales').textContent = money.format(m.today_paid_amount);
+    document.getElementById('todayOrders').textContent =
+      `${integer.format(m.today_orders)} órdenes`;
+    document.getElementById('periodLabel').textContent = `Últimos ${days} días`;
+
+    const salesCtx = document.getElementById('salesChart');
+    if (salesChart) salesChart.destroy();
+    salesChart = new Chart(salesCtx, {
+      type: 'line',
+      data: {
+        labels: data.daily_sales.map(x => x.date),
+        datasets: [{
+          label: 'Ventas',
+          data: data.daily_sales.map(x => x.paid_amount),
+          borderWidth: 2,
+          tension: .28,
+          fill: false
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: {mode:'index', intersect:false},
+        plugins: {
+          legend: {display:false},
+          tooltip: {callbacks:{label: ctx => money.format(ctx.parsed.y)}}
+        },
+        scales: {
+          y: {ticks:{callback: value => money.format(value)}},
+          x: {grid:{display:false}}
+        }
+      }
+    });
+
+    const statusCtx = document.getElementById('statusChart');
+    if (statusChart) statusChart.destroy();
+    statusChart = new Chart(statusCtx, {
+      type: 'doughnut',
+      data: {
+        labels: data.order_statuses.map(x => x.status),
+        datasets: [{data: data.order_statuses.map(x => x.orders)}]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins:{legend:{position:'bottom'}}
+      }
+    });
+
+    document.getElementById('topSkuBody').innerHTML = data.top_skus.map(row => `
+      <tr>
+        <td><strong>${escapeHtml(row.sku)}</strong></td>
+        <td class="sku-title" title="${escapeHtml(row.title || '')}">
+          ${escapeHtml(row.title || '')}
+        </td>
+        <td class="num">${integer.format(row.units)}</td>
+        <td class="num">${money.format(row.gross_sales)}</td>
+      </tr>
+    `).join('');
+
+  } catch (error) {
+    showError(`No se pudo cargar el dashboard: ${error.message}`);
+  } finally {
+    document.getElementById('loading').style.display = 'none';
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;')
+    .replaceAll('"','&quot;')
+    .replaceAll("'","&#039;");
+}
+
+document.getElementById('days').addEventListener('change', loadDashboard);
+loadDashboard();
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html)
