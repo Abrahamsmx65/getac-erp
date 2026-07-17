@@ -186,8 +186,8 @@ def mercadolibre_auth() -> JSONResponse:
     )
 
 
-@app.get("/auth/mercadolibre/start")
-def mercadolibre_auth_start() -> RedirectResponse | JSONResponse:
+@app.get("/auth/mercadolibre/start", response_model=None)
+def mercadolibre_auth_start():
     response = mercadolibre_auth()
     if response.status_code != 200:
         return response

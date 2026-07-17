@@ -18,3 +18,8 @@ Incluye:
 - `GET /auth/mercadolibre/start`
 - `GET /auth/mercadolibre/callback`
 - `POST /webhooks/mercadolibre`
+
+
+## v0.2.1
+
+Corrige el error de FastAPI en la ruta `/auth/mercadolibre/start`.
