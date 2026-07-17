@@ -1,25 +1,26 @@
-# GETAC ERP v0.2
+# GETAC ERP v0.3
 
-Incluye:
+Esta versión agrega la primera sincronización real de ventas de Mercado Libre.
 
-- Comprobación real de PostgreSQL: `/health/database`
-- Creación automática de tablas
-- Inicio OAuth: `/auth/mercadolibre/start`
-- Intercambio del código por tokens
-- Guardado de la cuenta y tokens en PostgreSQL
-- Registro de webhooks en PostgreSQL
+## Nuevas tablas
+
+- `orders`
+- `order_items`
+- `payments`
 
 ## Rutas
 
-- `GET /`
-- `GET /health`
 - `GET /health/database`
-- `GET /auth/mercadolibre`
-- `GET /auth/mercadolibre/start`
-- `GET /auth/mercadolibre/callback`
-- `POST /webhooks/mercadolibre`
+- `POST /sync/mercadolibre/orders?days=30&max_orders=1000`
+- `GET /reports/mercadolibre/summary?days=30`
+- `GET /docs`
 
+## Ejecutar la primera sincronización
 
-## v0.2.1
+1. Abre `/docs`.
+2. Busca `POST /sync/mercadolibre/orders`.
+3. Presiona **Try it out**.
+4. Usa `days=30` y `max_orders=1000`.
+5. Presiona **Execute**.
 
-Corrige el error de FastAPI en la ruta `/auth/mercadolibre/start`.
+La aplicación renueva automáticamente el access token cuando sea necesario y guarda el nuevo refresh token.
