@@ -1,31 +1,33 @@
-# GETAC ERP v0.4 — Dashboard
+# GETAC ERP v0.5 — Sincronización masiva
 
-Incluye un dashboard web compatible con Mac, iPhone y cualquier navegador.
+Esta versión elimina el límite artificial de 5,000 órdenes.
 
-## Dashboard
+## Funcionamiento
 
-- `GET /dashboard`
+- La carga histórica se ejecuta en segundo plano.
+- Divide el periodo en bloques de 6 horas.
+- Cada bloque se pagina en grupos de 50 órdenes.
+- El progreso se guarda en PostgreSQL.
+- Si Railway reinicia, el trabajo se retoma desde el último bloque guardado.
+- Solo se permite una carga histórica activa al mismo tiempo.
 
-## API del dashboard
+## Iniciar desde el dashboard
 
-- `GET /api/dashboard/summary?days=30`
+Abre:
 
-## Indicadores incluidos
+`/dashboard`
 
-- Ventas acumuladas
-- Órdenes
-- Unidades
-- Ticket promedio
-- Ventas del día
-- Gráfica diaria
-- Estatus de órdenes
-- Top 10 SKUs
+Presiona:
 
-## Sincronización
+`Sincronizar 365 días`
 
-- `POST /sync/mercadolibre/orders?days=30&max_orders=1000`
+## Endpoints
 
-## Nota
+- `POST /sync/mercadolibre/historical?days=365`
+- `GET /sync/jobs`
+- `GET /sync/jobs/{job_id}`
+- `POST /sync/jobs/{job_id}/cancel`
 
-Esta versión corrige el cálculo de venta total para evitar duplicar el importe de una orden
-cuando contiene más de un artículo.
+## Importante
+
+No cierres ni mantengas abierta una petición larga. El trabajo continúa en Railway aunque cierres la pestaña.

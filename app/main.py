@@ -1,4 +1,6 @@
+import asyncio
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -162,6 +164,30 @@ class Payment(Base):
     order: Mapped[Order] = relationship(back_populates="payments")
 
 
+class SyncJob(Base):
+    __tablename__ = "sync_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    marketplace: Mapped[str] = mapped_column(String(30), nullable=False, default="MERCADO_LIBRE")
+    job_type: Mapped[str] = mapped_column(String(50), nullable=False, default="HISTORICAL_ORDERS")
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="PENDING")
+    date_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    current_chunk_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_chunk_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_offset: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    orders_processed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chunks_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_chunks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
 class WebhookEvent(Base):
     __tablename__ = "webhook_events"
 
@@ -207,15 +233,30 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="0.3.0",
+    version="0.5.0",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
+worker_task: asyncio.Task | None = None
+
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
+    global worker_task
     if engine is not None:
         Base.metadata.create_all(bind=engine)
+    worker_task = asyncio.create_task(sync_worker_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    global worker_task
+    if worker_task is not None:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
 
 
 def get_account(session) -> MarketplaceAccount | None:
@@ -372,9 +413,165 @@ def upsert_order(session, account: MarketplaceAccount, data: dict[str, Any]) -> 
     return order
 
 
+def format_meli_datetime(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000-00:00")
+
+
+def build_six_hour_chunks(start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
+    chunks: list[tuple[datetime, datetime]] = []
+    cursor = start
+    while cursor < end:
+        chunk_end = min(cursor + timedelta(hours=6), end)
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end
+    return chunks
+
+
+async def process_historical_job(job_id: str) -> None:
+    if SessionLocal is None:
+        return
+
+    with SessionLocal() as session:
+        job = session.get(SyncJob, job_id)
+        account = get_account(session)
+        if job is None or account is None:
+            return
+
+        job.status = "RUNNING"
+        job.started_at = job.started_at or utcnow()
+        job.updated_at = utcnow()
+        session.commit()
+
+        chunks = build_six_hour_chunks(job.date_from, job.date_to)
+        job.total_chunks = len(chunks)
+        session.commit()
+
+        start_index = 0
+        if job.current_chunk_from is not None:
+            for idx, (chunk_from, _) in enumerate(chunks):
+                if chunk_from >= job.current_chunk_from:
+                    start_index = idx
+                    break
+
+        try:
+            for chunk_index in range(start_index, len(chunks)):
+                chunk_from, chunk_to = chunks[chunk_index]
+
+                with SessionLocal() as chunk_session:
+                    job = chunk_session.get(SyncJob, job_id)
+                    account = get_account(chunk_session)
+                    if job is None or account is None:
+                        return
+                    if job.status == "CANCELLED":
+                        return
+
+                    offset = job.current_offset if job.current_chunk_from == chunk_from else 0
+                    job.current_chunk_from = chunk_from
+                    job.current_chunk_to = chunk_to
+                    job.current_offset = offset
+                    job.updated_at = utcnow()
+                    chunk_session.commit()
+
+                    while True:
+                        params = {
+                            "seller": account.external_user_id,
+                            "order.date_created.from": format_meli_datetime(chunk_from),
+                            "order.date_created.to": format_meli_datetime(chunk_to),
+                            "sort": "date_asc",
+                            "offset": offset,
+                            "limit": 50,
+                        }
+
+                        result = await meli_get(
+                            "https://api.mercadolibre.com/orders/search",
+                            account,
+                            chunk_session,
+                            params=params,
+                        )
+                        orders_data = result.get("results") or []
+                        total = int((result.get("paging") or {}).get("total") or 0)
+
+                        if not orders_data:
+                            break
+
+                        for order_data in orders_data:
+                            upsert_order(chunk_session, account, order_data)
+
+                        job = chunk_session.get(SyncJob, job_id)
+                        if job is None:
+                            return
+
+                        processed_now = len(orders_data)
+                        job.orders_processed += processed_now
+                        offset += processed_now
+                        job.current_offset = offset
+                        job.updated_at = utcnow()
+                        chunk_session.commit()
+
+                        if offset >= total or processed_now < 50:
+                            break
+
+                        await asyncio.sleep(0.12)
+
+                    job = chunk_session.get(SyncJob, job_id)
+                    if job is None:
+                        return
+                    job.chunks_completed = chunk_index + 1
+                    job.current_offset = 0
+                    job.current_chunk_from = chunks[chunk_index + 1][0] if chunk_index + 1 < len(chunks) else None
+                    job.current_chunk_to = chunks[chunk_index + 1][1] if chunk_index + 1 < len(chunks) else None
+                    job.updated_at = utcnow()
+                    chunk_session.commit()
+
+            with SessionLocal() as final_session:
+                job = final_session.get(SyncJob, job_id)
+                if job:
+                    job.status = "SUCCESS"
+                    job.finished_at = utcnow()
+                    job.current_chunk_from = None
+                    job.current_chunk_to = None
+                    job.current_offset = 0
+                    job.updated_at = utcnow()
+                    final_session.commit()
+
+        except Exception as exc:
+            with SessionLocal() as error_session:
+                job = error_session.get(SyncJob, job_id)
+                if job:
+                    job.status = "ERROR"
+                    job.last_error = str(exc)[:4000]
+                    job.updated_at = utcnow()
+                    error_session.commit()
+
+
+async def sync_worker_loop() -> None:
+    while True:
+        try:
+            if SessionLocal is not None:
+                with SessionLocal() as session:
+                    job = session.scalar(
+                        select(SyncJob)
+                        .where(SyncJob.status.in_(["PENDING", "RUNNING"]))
+                        .order_by(SyncJob.created_at.asc())
+                    )
+                    job_id = job.id if job else None
+
+                if job_id:
+                    await process_historical_job(job_id)
+                else:
+                    await asyncio.sleep(5)
+            else:
+                await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print({"sync_worker_error": str(exc)})
+            await asyncio.sleep(10)
+
+
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "0.3.0"}
+    return {"service": "GETAC ERP API", "status": "online", "version": "0.5.0"}
 
 
 @app.get("/health")
@@ -403,6 +600,7 @@ def database_health() -> JSONResponse:
                     "payments",
                     "webhook_events",
                     "sync_logs",
+                    "sync_jobs",
                 ],
             }
         )
@@ -863,6 +1061,146 @@ def dashboard_summary(days: int = Query(default=30, ge=1, le=365)) -> JSONRespon
     )
 
 
+@app.post("/sync/mercadolibre/historical")
+def create_historical_sync(
+    days: int = Query(default=365, ge=1, le=730),
+) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(status_code=500, content={"error": "database_not_configured"})
+
+    with SessionLocal() as session:
+        account = get_account(session)
+        if account is None:
+            return JSONResponse(status_code=400, content={"error": "mercadolibre_not_connected"})
+
+        existing = session.scalar(
+            select(SyncJob).where(
+                SyncJob.marketplace == "MERCADO_LIBRE",
+                SyncJob.job_type == "HISTORICAL_ORDERS",
+                SyncJob.status.in_(["PENDING", "RUNNING"]),
+            )
+        )
+        if existing is not None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "already_running",
+                    "job_id": existing.id,
+                    "message": "Ya existe una sincronización histórica activa.",
+                },
+            )
+
+        end = utcnow()
+        start = end - timedelta(days=days)
+        chunks = build_six_hour_chunks(start, end)
+        job = SyncJob(
+            id=str(uuid.uuid4()),
+            marketplace="MERCADO_LIBRE",
+            job_type="HISTORICAL_ORDERS",
+            status="PENDING",
+            date_from=start,
+            date_to=end,
+            total_chunks=len(chunks),
+        )
+        session.add(job)
+        session.commit()
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "queued",
+                "job_id": job.id,
+                "days": days,
+                "total_chunks": len(chunks),
+                "status_url": f"/sync/jobs/{job.id}",
+            },
+        )
+
+
+@app.get("/sync/jobs/{job_id}")
+def get_sync_job(job_id: str) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(status_code=500, content={"error": "database_not_configured"})
+
+    with SessionLocal() as session:
+        job = session.get(SyncJob, job_id)
+        if job is None:
+            return JSONResponse(status_code=404, content={"error": "job_not_found"})
+
+        progress = 0.0
+        if job.total_chunks:
+            progress = round((job.chunks_completed / job.total_chunks) * 100, 2)
+
+        return JSONResponse(
+            content={
+                "job_id": job.id,
+                "marketplace": job.marketplace,
+                "job_type": job.job_type,
+                "status": job.status,
+                "date_from": job.date_from.isoformat(),
+                "date_to": job.date_to.isoformat(),
+                "orders_processed": job.orders_processed,
+                "chunks_completed": job.chunks_completed,
+                "total_chunks": job.total_chunks,
+                "progress_percent": progress,
+                "current_chunk_from": job.current_chunk_from.isoformat() if job.current_chunk_from else None,
+                "current_chunk_to": job.current_chunk_to.isoformat() if job.current_chunk_to else None,
+                "started_at": job.started_at.isoformat() if job.started_at else None,
+                "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+                "last_error": job.last_error,
+            }
+        )
+
+
+@app.get("/sync/jobs")
+def list_sync_jobs(limit: int = Query(default=20, ge=1, le=100)) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(status_code=500, content={"error": "database_not_configured"})
+
+    with SessionLocal() as session:
+        jobs = session.scalars(
+            select(SyncJob).order_by(SyncJob.created_at.desc()).limit(limit)
+        ).all()
+
+        return JSONResponse(
+            content={
+                "jobs": [
+                    {
+                        "job_id": job.id,
+                        "status": job.status,
+                        "orders_processed": job.orders_processed,
+                        "chunks_completed": job.chunks_completed,
+                        "total_chunks": job.total_chunks,
+                        "created_at": job.created_at.isoformat(),
+                    }
+                    for job in jobs
+                ]
+            }
+        )
+
+
+@app.post("/sync/jobs/{job_id}/cancel")
+def cancel_sync_job(job_id: str) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(status_code=500, content={"error": "database_not_configured"})
+
+    with SessionLocal() as session:
+        job = session.get(SyncJob, job_id)
+        if job is None:
+            return JSONResponse(status_code=404, content={"error": "job_not_found"})
+        if job.status in ("SUCCESS", "ERROR", "CANCELLED"):
+            return JSONResponse(
+                status_code=409,
+                content={"error": "job_not_active", "status": job.status},
+            )
+
+        job.status = "CANCELLED"
+        job.finished_at = utcnow()
+        job.updated_at = utcnow()
+        session.commit()
+        return JSONResponse(content={"status": "cancelled", "job_id": job.id})
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> HTMLResponse:
     html = r"""
@@ -997,6 +1335,19 @@ def dashboard() -> HTMLResponse:
     </div>
 
     <div id="error" class="error"></div>
+
+    <div class="panel" style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap">
+        <div>
+          <h2 style="margin-bottom:6px">Sincronización histórica</h2>
+          <div id="syncStatus" class="subtitle">Sin trabajo activo</div>
+        </div>
+        <button onclick="startHistoricalSync()">Sincronizar 365 días</button>
+      </div>
+      <div style="margin-top:14px;background:#eef1f5;border-radius:999px;height:10px;overflow:hidden">
+        <div id="syncProgress" style="height:100%;width:0%;background:#111827;transition:width .3s"></div>
+      </div>
+    </div>
 
     <section class="cards">
       <div class="card">
@@ -1160,8 +1511,63 @@ function escapeHtml(value) {
     .replaceAll("'","&#039;");
 }
 
+
+let currentSyncJobId = null;
+
+async function startHistoricalSync() {
+  try {
+    const response = await fetch('/sync/mercadolibre/historical?days=365', {method:'POST'});
+    const data = await response.json();
+    if (response.status === 409 && data.job_id) {
+      currentSyncJobId = data.job_id;
+    } else if (!response.ok) {
+      throw new Error(data.message || data.error || `Error ${response.status}`);
+    } else {
+      currentSyncJobId = data.job_id;
+    }
+    pollSyncStatus();
+  } catch (error) {
+    showError(`No se pudo iniciar la sincronización: ${error.message}`);
+  }
+}
+
+async function discoverActiveSync() {
+  try {
+    const response = await fetch('/sync/jobs?limit=5', {cache:'no-store'});
+    if (!response.ok) return;
+    const data = await response.json();
+    const active = (data.jobs || []).find(x => ['PENDING','RUNNING'].includes(x.status));
+    if (active) {
+      currentSyncJobId = active.job_id;
+      pollSyncStatus();
+    }
+  } catch (_) {}
+}
+
+async function pollSyncStatus() {
+  if (!currentSyncJobId) return;
+  try {
+    const response = await fetch(`/sync/jobs/${currentSyncJobId}`, {cache:'no-store'});
+    if (!response.ok) return;
+    const job = await response.json();
+    document.getElementById('syncProgress').style.width = `${job.progress_percent || 0}%`;
+    document.getElementById('syncStatus').textContent =
+      `${job.status} · ${integer.format(job.orders_processed)} órdenes · ` +
+      `${job.progress_percent}% (${job.chunks_completed}/${job.total_chunks} bloques)`;
+
+    if (['PENDING','RUNNING'].includes(job.status)) {
+      setTimeout(pollSyncStatus, 5000);
+    } else if (job.status === 'SUCCESS') {
+      loadDashboard();
+    }
+  } catch (_) {
+    setTimeout(pollSyncStatus, 10000);
+  }
+}
+
 document.getElementById('days').addEventListener('change', loadDashboard);
 loadDashboard();
+discoverActiveSync();
 </script>
 </body>
 </html>
