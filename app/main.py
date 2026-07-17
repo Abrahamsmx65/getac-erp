@@ -1178,7 +1178,72 @@ def list_sync_jobs(limit: int = Query(default=20, ge=1, le=100)) -> JSONResponse
             }
         )
 
+@app.post("/sync/jobs/{job_id}/resume")
+def resume_sync_job(job_id: str) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
 
+    with SessionLocal() as session:
+        job = session.get(SyncJob, job_id)
+
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "job_not_found"},
+            )
+
+        if job.status not in ("ERROR", "CANCELLED"):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "job_not_resumable",
+                    "status": job.status,
+                },
+            )
+
+        active_job = session.scalar(
+            select(SyncJob).where(
+                SyncJob.id != job_id,
+                SyncJob.marketplace == job.marketplace,
+                SyncJob.status.in_(["PENDING", "RUNNING"]),
+            )
+        )
+
+        if active_job is not None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "another_job_active",
+                    "active_job_id": active_job.id,
+                },
+            )
+
+        job.status = "PENDING"
+        job.last_error = None
+        job.finished_at = None
+        job.updated_at = utcnow()
+
+        session.commit()
+
+        progress = 0
+        if job.total_chunks:
+            progress = round(
+                (job.chunks_completed / job.total_chunks) * 100,
+                2,
+            )
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "queued",
+                "job_id": job.id,
+                "resume_from_chunk": job.chunks_completed,
+                "progress_percent": progress,
+            },
+        )
 @app.post("/sync/jobs/{job_id}/cancel")
 def cancel_sync_job(job_id: str) -> JSONResponse:
     if SessionLocal is None:
