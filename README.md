@@ -1,33 +1,20 @@
-# GETAC ERP Starter
+# GETAC ERP v0.2
 
-Backend inicial para:
+Incluye:
 
-- Mercado Libre OAuth
-- Webhook de notificaciones
-- PostgreSQL / Supabase
-- Railway
-- Futuro conector Amazon SP-API
+- Comprobación real de PostgreSQL: `/health/database`
+- Creación automática de tablas
+- Inicio OAuth: `/auth/mercadolibre/start`
+- Intercambio del código por tokens
+- Guardado de la cuenta y tokens en PostgreSQL
+- Registro de webhooks en PostgreSQL
 
-## Rutas iniciales
+## Rutas
 
 - `GET /`
 - `GET /health`
+- `GET /health/database`
 - `GET /auth/mercadolibre`
+- `GET /auth/mercadolibre/start`
 - `GET /auth/mercadolibre/callback`
 - `POST /webhooks/mercadolibre`
-
-## Despliegue
-
-Railway detectará el `Dockerfile` y ejecutará FastAPI.
-
-## Variables privadas en Railway
-
-Configura posteriormente:
-
-- `DATABASE_URL`
-- `MELI_CLIENT_ID`
-- `MELI_CLIENT_SECRET`
-- `MELI_REDIRECT_URI`
-- `MELI_WEBHOOK_URL`
-
-Nunca subas `.env` ni contraseñas a GitHub.
