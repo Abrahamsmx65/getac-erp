@@ -296,25 +296,108 @@ async def refresh_access_token(account: MarketplaceAccount, session) -> str:
     return account.access_token
 
 
-async def meli_get(url: str, account: MarketplaceAccount, session, params: dict | None = None):
-    if account.token_expires_at and account.token_expires_at <= utcnow() + timedelta(minutes=5):
+async def meli_get(
+    url: str,
+    account: MarketplaceAccount,
+    session,
+    params: dict | None = None,
+    max_retries: int = 10,
+):
+    """
+    Consulta la API de Mercado Libre.
+
+    Maneja automáticamente:
+    - renovación del access token;
+    - límite 429 Too Many Requests;
+    - errores temporales 500, 502, 503 y 504;
+    - esperas progresivas antes de volver a intentar.
+    """
+
+    if (
+        account.token_expires_at
+        and account.token_expires_at
+        <= utcnow() + timedelta(minutes=5)
+    ):
         await refresh_access_token(account, session)
 
-    async with httpx.AsyncClient(timeout=45) as client:
-        response = await client.get(
-            url,
-            params=params,
-            headers={"Authorization": f"Bearer {account.access_token}"},
-        )
-        if response.status_code == 401:
-            token = await refresh_access_token(account, session)
+    base_delay = 5
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        for attempt in range(max_retries + 1):
             response = await client.get(
                 url,
                 params=params,
-                headers={"Authorization": f"Bearer {token}"},
+                headers={
+                    "Authorization": f"Bearer {account.access_token}",
+                },
             )
-    response.raise_for_status()
-    return response.json()
+
+            # Access token vencido
+            if response.status_code == 401:
+                new_token = await refresh_access_token(account, session)
+
+                response = await client.get(
+                    url,
+                    params=params,
+                    headers={
+                        "Authorization": f"Bearer {new_token}",
+                    },
+                )
+
+            # Mercado Libre está limitando las solicitudes
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+
+                try:
+                    delay = (
+                        float(retry_after)
+                        if retry_after
+                        else base_delay * (2 ** attempt)
+                    )
+                except (TypeError, ValueError):
+                    delay = base_delay * (2 ** attempt)
+
+                # Máximo cinco minutos entre intentos
+                delay = min(delay, 300)
+
+                print(
+                    {
+                        "event": "mercadolibre_rate_limit",
+                        "status_code": 429,
+                        "attempt": attempt + 1,
+                        "max_retries": max_retries,
+                        "delay_seconds": delay,
+                        "request_url": str(response.request.url),
+                    }
+                )
+
+                await asyncio.sleep(delay)
+                continue
+
+            # Errores temporales del servidor de Mercado Libre
+            if response.status_code in (500, 502, 503, 504):
+                delay = min(base_delay * (2 ** attempt), 180)
+
+                print(
+                    {
+                        "event": "mercadolibre_temporary_error",
+                        "status_code": response.status_code,
+                        "attempt": attempt + 1,
+                        "max_retries": max_retries,
+                        "delay_seconds": delay,
+                    }
+                )
+
+                await asyncio.sleep(delay)
+                continue
+
+            response.raise_for_status()
+            return response.json()
+
+    raise RuntimeError(
+        "Mercado Libre continuó respondiendo con límites o errores "
+        f"temporales después de {max_retries + 1} intentos."
+    )
 
 
 def upsert_order(session, account: MarketplaceAccount, data: dict[str, Any]) -> Order:
@@ -511,7 +594,7 @@ async def process_historical_job(job_id: str) -> None:
                         if offset >= total or processed_now < 50:
                             break
 
-                        await asyncio.sleep(0.12)
+                        await asyncio.sleep(1.25)
 
                     job = chunk_session.get(SyncJob, job_id)
                     if job is None:
