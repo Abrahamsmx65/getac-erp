@@ -1,25 +1,37 @@
-# GETAC ERP v0.7.2 — Nombres correctos de categorías
+# GETAC ERP v0.8 — Inventario FULL
 
-Corrige el filtro de categorías.
+Incluye una nueva sección:
 
-Antes mostraba códigos internos como:
+`/full`
 
-- MLM192062
-- MLM192717
+Muestra:
 
-Ahora consulta el catálogo oficial de categorías de Mercado Libre y muestra
-el nombre y la ruta entendible de cada categoría.
+- SKU
+- Producto
+- Inventory ID
+- Stock disponible en FULL
+- Stock no disponible
+- Ventas de los últimos 30 días
+- Promedio diario
+- Días estimados de inventario
+- Alertas por cobertura baja
+- Buscador
+- Botón para actualizar stock FULL
 
-Ejemplo:
+## Primera ejecución
 
-Calzado › Sandalias y chanclas
+Después del despliegue:
 
-Internamente el filtro continúa usando el ID de Mercado Libre, por lo que
-los resultados siguen siendo precisos.
+1. Abre `/full`
+2. Presiona `Actualizar stock FULL`
+3. El sistema recorrerá las publicaciones y variaciones de la cuenta
+4. Consultará el stock real de cada `inventory_id`
+5. Guardará el resultado en PostgreSQL
 
-## Nueva tabla automática
+La primera actualización puede tardar por el número de publicaciones.
+Las siguientes consultas del dashboard usan PostgreSQL y son rápidas.
 
-- category_cache
+## Tablas automáticas
 
-Guarda los nombres para no consultar Mercado Libre cada vez que se abre el dashboard.
-La tabla se crea automáticamente al desplegar.
+- `full_inventory`
+- `full_sync_runs`

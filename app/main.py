@@ -204,17 +204,39 @@ class Payment(Base):
     order: Mapped[Order] = relationship(back_populates="payments")
 
 
-class CategoryCache(Base):
-    __tablename__ = "category_cache"
+class FullInventory(Base):
+    __tablename__ = "full_inventory"
 
-    category_id: Mapped[str] = mapped_column(String(80), primary_key=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    path_from_root: Mapped[list[Any] | None] = mapped_column(JSON)
-    updated_at: Mapped[datetime] = mapped_column(
+    inventory_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    item_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    variation_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    sku: Mapped[str | None] = mapped_column(String(180), index=True)
+    title: Mapped[str | None] = mapped_column(String(500))
+    category_id: Mapped[str | None] = mapped_column(String(80))
+    total_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    not_available_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    not_available_detail: Mapped[list[Any] | None] = mapped_column(JSON)
+    last_synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         default=utcnow,
-        onupdate=utcnow,
+    )
+
+
+class FullSyncRun(Base):
+    __tablename__ = "full_sync_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="PENDING")
+    items_found: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    inventories_found: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    inventories_processed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
     )
 
 
@@ -287,7 +309,7 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="0.7.2",
+    version="0.8.0",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
@@ -675,9 +697,184 @@ async def sync_worker_loop() -> None:
             await asyncio.sleep(10)
 
 
+def extract_sku(data: dict[str, Any]) -> str | None:
+    direct = data.get("seller_custom_field") or data.get("seller_sku")
+    if direct:
+        return str(direct).strip().upper()
+
+    for attribute in data.get("attributes") or []:
+        if attribute.get("id") in ("SELLER_SKU", "SELLER_CUSTOM_FIELD"):
+            value = attribute.get("value_name") or attribute.get("value_id")
+            if value:
+                return str(value).strip().upper()
+    return None
+
+
+async def list_all_seller_item_ids(
+    account: MarketplaceAccount,
+    session,
+) -> list[str]:
+    item_ids: list[str] = []
+    url = (
+        f"https://api.mercadolibre.com/users/"
+        f"{account.external_user_id}/items/search"
+    )
+    params: dict[str, Any] = {"search_type": "scan", "limit": 100}
+
+    while True:
+        payload = await meli_get(url, account, session, params=params)
+        results = payload.get("results") or []
+        item_ids.extend(str(value) for value in results)
+
+        scroll_id = payload.get("scroll_id")
+        if not scroll_id or not results:
+            break
+
+        params = {
+            "search_type": "scan",
+            "limit": 100,
+            "scroll_id": scroll_id,
+        }
+        await asyncio.sleep(0.4)
+
+    return list(dict.fromkeys(item_ids))
+
+
+async def sync_full_inventory_run(run_id: str) -> None:
+    if SessionLocal is None:
+        return
+
+    try:
+        with SessionLocal() as session:
+            run = session.get(FullSyncRun, run_id)
+            account = get_account(session)
+            if run is None or account is None:
+                return
+
+            run.status = "RUNNING"
+            run.started_at = utcnow()
+            session.commit()
+
+            item_ids = await list_all_seller_item_ids(account, session)
+            run.items_found = len(item_ids)
+            session.commit()
+
+            inventory_records: list[dict[str, Any]] = []
+
+            for index in range(0, len(item_ids), 20):
+                batch = item_ids[index:index + 20]
+                payload = await meli_get(
+                    "https://api.mercadolibre.com/items",
+                    account,
+                    session,
+                    params={
+                        "ids": ",".join(batch),
+                        "attributes": (
+                            "id,title,category_id,inventory_id,"
+                            "seller_custom_field,attributes,variations"
+                        ),
+                    },
+                )
+
+                responses = payload if isinstance(payload, list) else []
+                for response_item in responses:
+                    body = response_item.get("body") or {}
+                    item_id = body.get("id")
+                    title = body.get("title")
+                    category_id = body.get("category_id")
+
+                    main_inventory_id = body.get("inventory_id")
+                    if main_inventory_id:
+                        inventory_records.append({
+                            "inventory_id": str(main_inventory_id),
+                            "item_id": str(item_id) if item_id else None,
+                            "variation_id": None,
+                            "sku": extract_sku(body),
+                            "title": title,
+                            "category_id": category_id,
+                        })
+
+                    for variation in body.get("variations") or []:
+                        inventory_id = variation.get("inventory_id")
+                        if not inventory_id:
+                            continue
+                        inventory_records.append({
+                            "inventory_id": str(inventory_id),
+                            "item_id": str(item_id) if item_id else None,
+                            "variation_id": (
+                                str(variation.get("id"))
+                                if variation.get("id") is not None
+                                else None
+                            ),
+                            "sku": extract_sku(variation) or extract_sku(body),
+                            "title": title,
+                            "category_id": category_id,
+                        })
+
+                await asyncio.sleep(0.5)
+
+            unique_records = {
+                record["inventory_id"]: record
+                for record in inventory_records
+            }
+            run.inventories_found = len(unique_records)
+            session.commit()
+
+            for record in unique_records.values():
+                stock = await meli_get(
+                    (
+                        "https://api.mercadolibre.com/inventories/"
+                        f"{record['inventory_id']}/stock/fulfillment"
+                    ),
+                    account,
+                    session,
+                )
+
+                row = FullInventory(
+                    inventory_id=record["inventory_id"],
+                    item_id=record["item_id"],
+                    variation_id=record["variation_id"],
+                    sku=record["sku"],
+                    title=record["title"],
+                    category_id=record["category_id"],
+                    total_quantity=int(stock.get("total") or 0),
+                    available_quantity=int(
+                        stock.get("available_quantity") or 0
+                    ),
+                    not_available_quantity=int(
+                        stock.get("not_available_quantity") or 0
+                    ),
+                    not_available_detail=(
+                        stock.get("not_available_detail") or []
+                    ),
+                    last_synced_at=utcnow(),
+                )
+                session.merge(row)
+
+                run.inventories_processed += 1
+                if run.inventories_processed % 20 == 0:
+                    session.commit()
+
+                await asyncio.sleep(0.8)
+
+            run.status = "SUCCESS"
+            run.finished_at = utcnow()
+            run.last_error = None
+            session.commit()
+
+    except Exception as exc:
+        with SessionLocal() as session:
+            run = session.get(FullSyncRun, run_id)
+            if run:
+                run.status = "ERROR"
+                run.last_error = str(exc)[:4000]
+                run.finished_at = utcnow()
+                session.commit()
+
+
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "0.7.2", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "0.8.0", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -688,7 +885,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "0.7.2",
+        "version": "0.8.0",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
@@ -718,7 +915,8 @@ def database_health() -> JSONResponse:
                     "webhook_events",
                     "sync_logs",
                     "sync_jobs",
-                    "category_cache",
+                    "full_inventory",
+                    "full_sync_runs",
                 ],
             }
         )
@@ -1003,7 +1201,7 @@ async def mercadolibre_webhook(request: Request) -> JSONResponse:
 
     return JSONResponse(status_code=200, content={"status": "received"})
 @app.get("/api/dashboard/summary")
-async def dashboard_summary(
+def dashboard_summary(
     days: int = Query(default=30, ge=1, le=730),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
@@ -1148,32 +1346,25 @@ async def dashboard_summary(
             params,
         ).mappings().all()
 
-        category_ids = session.execute(
+        categories = session.execute(
             text(
                 """
-                SELECT DISTINCT category_id
+                SELECT DISTINCT category_value
                 FROM (
                     SELECT
-                        NULLIF(
-                            UPPER(
-                                COALESCE(
-                                    oi.raw_data #>> '{item,category_id}',
-                                    ''
-                                )
-                            ),
-                            ''
-                        ) AS category_id
+                        NULLIF(UPPER(COALESCE(oi.raw_data #>> '{item,category_id}', '')), '') AS category_value
+                    FROM order_items oi
+                    UNION
+                    SELECT
+                        NULLIF(UPPER(COALESCE(oi.raw_data #>> '{item,domain_id}', '')), '') AS category_value
                     FROM order_items oi
                 ) q
-                WHERE category_id IS NOT NULL
-                  AND category_id LIKE 'MLM%'
-                ORDER BY category_id
+                WHERE category_value IS NOT NULL
+                ORDER BY category_value
                 LIMIT 500
                 """
             )
         ).scalars().all()
-
-        categories = await resolve_category_names(category_ids, session)
 
     return JSONResponse(
         content={
@@ -1431,6 +1622,399 @@ def product_model_detail(
     )
 
 
+@app.post("/sync/mercadolibre/full")
+async def start_full_sync() -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    with SessionLocal() as session:
+        account = get_account(session)
+        if account is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "mercadolibre_not_connected"},
+            )
+
+        active = session.scalar(
+            select(FullSyncRun).where(
+                FullSyncRun.status.in_(["PENDING", "RUNNING"])
+            )
+        )
+        if active:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "already_running",
+                    "run_id": active.id,
+                },
+            )
+
+        run = FullSyncRun(id=str(uuid.uuid4()), status="PENDING")
+        session.add(run)
+        session.commit()
+        run_id = run.id
+
+    asyncio.create_task(sync_full_inventory_run(run_id))
+
+    return JSONResponse(
+        status_code=202,
+        content={"status": "queued", "run_id": run_id},
+    )
+
+
+@app.get("/sync/mercadolibre/full/status")
+def full_sync_status() -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    with SessionLocal() as session:
+        run = session.scalar(
+            select(FullSyncRun)
+            .order_by(FullSyncRun.created_at.desc())
+            .limit(1)
+        )
+
+        if run is None:
+            return JSONResponse(content={"status": "NEVER_RUN"})
+
+        progress = 0.0
+        if run.inventories_found:
+            progress = round(
+                run.inventories_processed
+                / run.inventories_found
+                * 100,
+                2,
+            )
+
+        return JSONResponse(content={
+            "run_id": run.id,
+            "status": run.status,
+            "items_found": run.items_found,
+            "inventories_found": run.inventories_found,
+            "inventories_processed": run.inventories_processed,
+            "progress_percent": progress,
+            "started_at": (
+                run.started_at.isoformat()
+                if run.started_at else None
+            ),
+            "finished_at": (
+                run.finished_at.isoformat()
+                if run.finished_at else None
+            ),
+            "last_error": run.last_error,
+        })
+
+
+@app.get("/api/full/inventory")
+def full_inventory_report(
+    search: str | None = Query(default=None),
+    days: int = Query(default=30, ge=1, le=365),
+    limit: int = Query(default=5000, ge=1, le=20000),
+) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    since = utcnow() - timedelta(days=days)
+    search_value = (search or "").strip().upper()
+
+    with SessionLocal() as session:
+        rows = session.execute(
+            text(
+                """
+                WITH sales AS (
+                    SELECT
+                        UPPER(BTRIM(oi.seller_sku)) AS sku,
+                        COALESCE(SUM(oi.quantity), 0) AS units_sold
+                    FROM order_items oi
+                    JOIN orders o ON o.id = oi.order_id
+                    WHERE o.marketplace = 'MERCADO_LIBRE'
+                      AND o.date_created >= :since
+                      AND COALESCE(o.status, '') NOT IN (
+                          'cancelled',
+                          'invalid'
+                      )
+                      AND oi.seller_sku IS NOT NULL
+                    GROUP BY UPPER(BTRIM(oi.seller_sku))
+                )
+                SELECT
+                    fi.inventory_id,
+                    fi.item_id,
+                    fi.variation_id,
+                    fi.sku,
+                    fi.title,
+                    fi.category_id,
+                    fi.total_quantity,
+                    fi.available_quantity,
+                    fi.not_available_quantity,
+                    fi.last_synced_at,
+                    COALESCE(s.units_sold, 0) AS units_sold,
+                    CASE
+                        WHEN COALESCE(s.units_sold, 0) > 0
+                            THEN ROUND(
+                                fi.available_quantity::numeric
+                                / (s.units_sold::numeric / :days),
+                                1
+                            )
+                        ELSE NULL
+                    END AS days_of_stock
+                FROM full_inventory fi
+                LEFT JOIN sales s
+                  ON s.sku = UPPER(BTRIM(fi.sku))
+                WHERE (
+                    :search_value = ''
+                    OR UPPER(COALESCE(fi.sku, ''))
+                        LIKE :search_like
+                    OR UPPER(COALESCE(fi.title, ''))
+                        LIKE :search_like
+                    OR UPPER(fi.inventory_id)
+                        LIKE :search_like
+                )
+                ORDER BY
+                    CASE
+                        WHEN COALESCE(s.units_sold, 0) > 0
+                            THEN fi.available_quantity::numeric
+                                 / (s.units_sold::numeric / :days)
+                        ELSE 999999
+                    END ASC,
+                    COALESCE(s.units_sold, 0) DESC
+                LIMIT :limit
+                """
+            ),
+            {
+                "since": since,
+                "days": days,
+                "search_value": search_value,
+                "search_like": f"%{search_value}%",
+                "limit": limit,
+            },
+        ).mappings().all()
+
+    return JSONResponse(content={
+        "status": "ok",
+        "days": days,
+        "items": [
+            {
+                "inventory_id": row["inventory_id"],
+                "item_id": row["item_id"],
+                "variation_id": row["variation_id"],
+                "sku": row["sku"],
+                "title": row["title"],
+                "category_id": row["category_id"],
+                "total_quantity": int(
+                    row["total_quantity"] or 0
+                ),
+                "available_quantity": int(
+                    row["available_quantity"] or 0
+                ),
+                "not_available_quantity": int(
+                    row["not_available_quantity"] or 0
+                ),
+                "units_sold": int(row["units_sold"] or 0),
+                "daily_average": round(
+                    float(row["units_sold"] or 0) / days,
+                    2,
+                ),
+                "days_of_stock": (
+                    float(row["days_of_stock"])
+                    if row["days_of_stock"] is not None
+                    else None
+                ),
+                "last_synced_at": (
+                    row["last_synced_at"].isoformat()
+                    if row["last_synced_at"] else None
+                ),
+            }
+            for row in rows
+        ],
+    })
+
+
+@app.get("/full", response_class=HTMLResponse)
+def full_page() -> HTMLResponse:
+    return HTMLResponse(content=r"""
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GETAC ERP — Inventario FULL</title>
+<style>
+:root{--bg:#f4f6f8;--panel:#fff;--text:#17202a;--muted:#667085;
+--border:#e6eaf0;--dark:#111827;--red:#b42318;--amber:#b54708;
+--green:#067647}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,
+"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
+.layout{display:grid;grid-template-columns:230px 1fr;min-height:100vh}
+.sidebar{background:var(--dark);color:#fff;padding:28px 20px}
+.brand{font-size:22px;font-weight:800;letter-spacing:.08em}
+.brand small{display:block;font-size:11px;opacity:.55;margin-top:4px}
+.nav{margin-top:32px;display:grid;gap:8px}
+.nav a{color:rgba(255,255,255,.72);text-decoration:none;
+padding:12px 14px;border-radius:10px;font-size:14px}
+.nav a.active{background:rgba(255,255,255,.12);color:#fff;font-weight:700}
+.main{padding:28px;overflow:hidden}
+.top{display:flex;justify-content:space-between;align-items:center;
+gap:16px;flex-wrap:wrap;margin-bottom:20px}
+h1{margin:0;font-size:28px}.sub{color:var(--muted);margin-top:5px}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+input,select,button{border:1px solid var(--border);background:#fff;
+padding:10px 12px;border-radius:10px;font-size:14px}
+input{min-width:260px}button{font-weight:700;cursor:pointer}
+.panel{background:#fff;border:1px solid var(--border);border-radius:16px;
+padding:20px;box-shadow:0 10px 30px rgba(16,24,40,.06)}
+.status{margin-bottom:16px}.bar{height:9px;border-radius:99px;
+background:#eef1f5;overflow:hidden;margin-top:10px}
+.bar div{height:100%;width:0;background:var(--dark)}
+.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;
+margin-bottom:16px}.card{background:#fff;border:1px solid var(--border);
+border-radius:14px;padding:16px}.label{font-size:13px;color:var(--muted)}
+.value{font-size:26px;font-weight:800;margin-top:6px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:11px 8px;border-bottom:1px solid var(--border);text-align:left}
+th{color:var(--muted);position:sticky;top:0;background:#fff}
+.num{text-align:right}.risk-high{color:var(--red);font-weight:800}
+.risk-mid{color:var(--amber);font-weight:800}
+.risk-ok{color:var(--green);font-weight:800}
+.table-wrap{overflow:auto;max-height:65vh}
+.error{display:none;background:#fff1f1;color:#9c2323;padding:12px;
+border-radius:10px;margin-bottom:14px}
+@media(max-width:900px){.layout{grid-template-columns:1fr}.sidebar{display:none}
+.summary{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<div class="brand">GETAC<small>ERP & ANALYTICS</small></div>
+<nav class="nav">
+<a href="/dashboard">Dashboard</a>
+<a class="active" href="/full">Inventario FULL</a>
+<a href="/docs">API y sincronización</a>
+</nav>
+</aside>
+<main class="main">
+<div class="top">
+<div><h1>Inventario FULL</h1>
+<div class="sub">Stock actual comparado con ventas recientes</div></div>
+<div class="controls">
+<select id="days"><option value="30" selected>Ventas 30 días</option>
+<option value="7">Ventas 7 días</option>
+<option value="60">Ventas 60 días</option>
+<option value="90">Ventas 90 días</option></select>
+<input id="search" type="search" placeholder="Buscar SKU, producto o inventory ID">
+<button onclick="loadInventory()">Buscar</button>
+<button onclick="startSync()">Actualizar stock FULL</button>
+</div>
+</div>
+<div id="error" class="error"></div>
+<div class="panel status">
+<strong>Actualización de FULL</strong>
+<div id="syncText" class="sub">Consultando estado…</div>
+<div class="bar"><div id="progress"></div></div>
+</div>
+<section class="summary">
+<div class="card"><div class="label">SKUs FULL</div>
+<div id="skuCount" class="value">0</div></div>
+<div class="card"><div class="label">Stock disponible</div>
+<div id="stockTotal" class="value">0</div></div>
+<div class="card"><div class="label">Ventas del periodo</div>
+<div id="salesTotal" class="value">0</div></div>
+<div class="card"><div class="label">Riesgo ≤ 15 días</div>
+<div id="riskCount" class="value">0</div></div>
+</section>
+<div class="panel">
+<div class="table-wrap">
+<table>
+<thead><tr>
+<th>SKU</th><th>Producto</th><th>Inventory ID</th>
+<th class="num">Stock FULL</th><th class="num">No disponible</th>
+<th class="num">Ventas</th><th class="num">Promedio/día</th>
+<th class="num">Días de stock</th>
+</tr></thead>
+<tbody id="body"></tbody>
+</table>
+</div>
+</div>
+</main>
+</div>
+<script>
+const integer=new Intl.NumberFormat('es-MX');
+function esc(v){return String(v??'').replaceAll('&','&amp;')
+.replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}
+function showError(v){const e=document.getElementById('error');
+e.textContent=v;e.style.display='block'}
+async function loadInventory(){
+document.getElementById('error').style.display='none';
+const days=document.getElementById('days').value;
+const search=document.getElementById('search').value.trim();
+try{
+const p=new URLSearchParams({days,limit:'10000'});
+if(search)p.set('search',search);
+const r=await fetch('/api/full/inventory?'+p.toString(),{cache:'no-store'});
+if(!r.ok)throw new Error('Error '+r.status);
+const d=await r.json(),items=d.items||[];
+document.getElementById('skuCount').textContent=integer.format(items.length);
+document.getElementById('stockTotal').textContent=integer.format(
+items.reduce((a,x)=>a+x.available_quantity,0));
+document.getElementById('salesTotal').textContent=integer.format(
+items.reduce((a,x)=>a+x.units_sold,0));
+document.getElementById('riskCount').textContent=integer.format(
+items.filter(x=>x.days_of_stock!==null&&x.days_of_stock<=15).length);
+document.getElementById('body').innerHTML=items.map(x=>{
+let cls='';if(x.days_of_stock!==null){
+cls=x.days_of_stock<=15?'risk-high':x.days_of_stock<=30?'risk-mid':'risk-ok'}
+return `<tr><td><strong>${esc(x.sku||'SIN SKU')}</strong></td>
+<td>${esc(x.title||'')}</td><td>${esc(x.inventory_id)}</td>
+<td class="num">${integer.format(x.available_quantity)}</td>
+<td class="num">${integer.format(x.not_available_quantity)}</td>
+<td class="num">${integer.format(x.units_sold)}</td>
+<td class="num">${x.daily_average.toFixed(2)}</td>
+<td class="num ${cls}">${x.days_of_stock===null?'Sin ventas':
+x.days_of_stock.toFixed(1)}</td></tr>`}).join('');
+}catch(e){showError('No se pudo cargar FULL: '+e.message)}
+}
+async function startSync(){
+try{
+const r=await fetch('/sync/mercadolibre/full',{method:'POST'});
+const d=await r.json();
+if(!r.ok&&r.status!==409)throw new Error(d.error||'Error '+r.status);
+pollStatus();
+}catch(e){showError('No se pudo iniciar: '+e.message)}
+}
+async function pollStatus(){
+try{
+const r=await fetch('/sync/mercadolibre/full/status',{cache:'no-store'});
+if(!r.ok)return;
+const d=await r.json();
+const pct=d.progress_percent||0;
+document.getElementById('progress').style.width=pct+'%';
+document.getElementById('syncText').textContent=
+`${d.status} · ${integer.format(d.inventories_processed||0)} de `+
+`${integer.format(d.inventories_found||0)} inventarios · ${pct}%`+
+(d.last_error?' · '+d.last_error:'');
+if(['PENDING','RUNNING'].includes(d.status))setTimeout(pollStatus,5000);
+if(d.status==='SUCCESS')loadInventory();
+}catch(e){setTimeout(pollStatus,10000)}
+}
+document.getElementById('search').addEventListener('keydown',
+e=>{if(e.key==='Enter')loadInventory()});
+document.getElementById('days').addEventListener('change',loadInventory);
+loadInventory();pollStatus();
+</script>
+</body></html>
+""")
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> HTMLResponse:
     html = r"""
@@ -1543,6 +2127,7 @@ def dashboard() -> HTMLResponse:
     <div class="brand">GETAC <small>ERP & ANALYTICS</small></div>
     <nav class="nav">
       <a class="active" href="/dashboard">Dashboard</a>
+      <a href="/full">Inventario FULL</a>
       <a href="/docs">API y sincronización</a>
       <a href="/reports/mercadolibre/summary?days=30">Resumen JSON</a>
     </nav>
@@ -1717,12 +2302,11 @@ async function loadDashboard() {
     const knownOptions = new Set(
       Array.from(categorySelect.options).map(option => option.value)
     );
-    (data.categories || []).forEach(categoryItem => {
-      const value = categoryItem.id;
+    (data.categories || []).forEach(value => {
       if (!knownOptions.has(value)) {
         const option = document.createElement('option');
         option.value = value;
-        option.textContent = categoryItem.label || categoryItem.name || value;
+        option.textContent = value;
         categorySelect.appendChild(option);
       }
     });
