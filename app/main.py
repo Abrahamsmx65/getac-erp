@@ -204,6 +204,20 @@ class Payment(Base):
     order: Mapped[Order] = relationship(back_populates="payments")
 
 
+class CategoryCache(Base):
+    __tablename__ = "category_cache"
+
+    category_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    path_from_root: Mapped[list[Any] | None] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+
 class SyncJob(Base):
     __tablename__ = "sync_jobs"
 
@@ -273,7 +287,7 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="0.7.1",
+    version="0.7.2",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
@@ -663,7 +677,7 @@ async def sync_worker_loop() -> None:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "0.7.1", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "0.7.2", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -674,7 +688,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "0.7.1",
+        "version": "0.7.2",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
@@ -704,6 +718,7 @@ def database_health() -> JSONResponse:
                     "webhook_events",
                     "sync_logs",
                     "sync_jobs",
+                    "category_cache",
                 ],
             }
         )
@@ -988,7 +1003,7 @@ async def mercadolibre_webhook(request: Request) -> JSONResponse:
 
     return JSONResponse(status_code=200, content={"status": "received"})
 @app.get("/api/dashboard/summary")
-def dashboard_summary(
+async def dashboard_summary(
     days: int = Query(default=30, ge=1, le=730),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
@@ -1133,25 +1148,32 @@ def dashboard_summary(
             params,
         ).mappings().all()
 
-        categories = session.execute(
+        category_ids = session.execute(
             text(
                 """
-                SELECT DISTINCT category_value
+                SELECT DISTINCT category_id
                 FROM (
                     SELECT
-                        NULLIF(UPPER(COALESCE(oi.raw_data #>> '{item,category_id}', '')), '') AS category_value
-                    FROM order_items oi
-                    UNION
-                    SELECT
-                        NULLIF(UPPER(COALESCE(oi.raw_data #>> '{item,domain_id}', '')), '') AS category_value
+                        NULLIF(
+                            UPPER(
+                                COALESCE(
+                                    oi.raw_data #>> '{item,category_id}',
+                                    ''
+                                )
+                            ),
+                            ''
+                        ) AS category_id
                     FROM order_items oi
                 ) q
-                WHERE category_value IS NOT NULL
-                ORDER BY category_value
+                WHERE category_id IS NOT NULL
+                  AND category_id LIKE 'MLM%'
+                ORDER BY category_id
                 LIMIT 500
                 """
             )
         ).scalars().all()
+
+        categories = await resolve_category_names(category_ids, session)
 
     return JSONResponse(
         content={
@@ -1695,11 +1717,12 @@ async function loadDashboard() {
     const knownOptions = new Set(
       Array.from(categorySelect.options).map(option => option.value)
     );
-    (data.categories || []).forEach(value => {
+    (data.categories || []).forEach(categoryItem => {
+      const value = categoryItem.id;
       if (!knownOptions.has(value)) {
         const option = document.createElement('option');
         option.value = value;
-        option.textContent = value;
+        option.textContent = categoryItem.label || categoryItem.name || value;
         categorySelect.appendChild(option);
       }
     });
