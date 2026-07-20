@@ -1,7 +1,7 @@
 import asyncio
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlencode
@@ -32,6 +32,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 MELI_CLIENT_ID = os.getenv("MELI_CLIENT_ID", "")
 MELI_CLIENT_SECRET = os.getenv("MELI_CLIENT_SECRET", "")
 MELI_REDIRECT_URI = os.getenv("MELI_REDIRECT_URI", "")
+SERVICE_ROLE = os.getenv("SERVICE_ROLE", "all").strip().lower()
 
 
 def utcnow() -> datetime:
@@ -52,6 +53,45 @@ def decimal_or_zero(value: Any) -> Decimal:
         return Decimal(str(value or 0))
     except Exception:
         return Decimal("0")
+
+
+def parse_date_range(
+    date_from: str | None,
+    date_to: str | None,
+    days: int,
+) -> tuple[datetime, datetime]:
+    now = utcnow()
+
+    if date_from:
+        try:
+            start_date = date.fromisoformat(date_from)
+            start = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise ValueError("date_from debe tener formato YYYY-MM-DD") from exc
+    else:
+        start = now - timedelta(days=days)
+
+    if date_to:
+        try:
+            end_date = date.fromisoformat(date_to)
+            end = datetime.combine(
+                end_date + timedelta(days=1),
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+        except ValueError as exc:
+            raise ValueError("date_to debe tener formato YYYY-MM-DD") from exc
+    else:
+        end = now
+
+    if start >= end:
+        raise ValueError("La fecha inicial debe ser anterior a la fecha final.")
+
+    return start, end
+
+
+def normalize_search(value: str | None) -> str:
+    return (value or "").strip().upper()
 
 
 class Base(DeclarativeBase):
@@ -233,7 +273,7 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="0.5.0",
+    version="0.7.1",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
@@ -243,9 +283,15 @@ worker_task: asyncio.Task | None = None
 @app.on_event("startup")
 async def startup() -> None:
     global worker_task
+
     if engine is not None:
         Base.metadata.create_all(bind=engine)
-    worker_task = asyncio.create_task(sync_worker_loop())
+
+    if SERVICE_ROLE in ("all", "worker"):
+        print({"service_role": SERVICE_ROLE, "worker": "started"})
+        worker_task = asyncio.create_task(sync_worker_loop())
+    else:
+        print({"service_role": SERVICE_ROLE, "worker": "disabled"})
 
 
 @app.on_event("shutdown")
@@ -301,93 +347,57 @@ async def meli_get(
     account: MarketplaceAccount,
     session,
     params: dict | None = None,
-    max_retries: int = 10,
+    max_retries: int = 8,
 ):
-    """
-    Consulta la API de Mercado Libre.
-
-    Maneja automáticamente:
-    - renovación del access token;
-    - límite 429 Too Many Requests;
-    - errores temporales 500, 502, 503 y 504;
-    - esperas progresivas antes de volver a intentar.
-    """
-
-    if (
-        account.token_expires_at
-        and account.token_expires_at
-        <= utcnow() + timedelta(minutes=5)
-    ):
+    if account.token_expires_at and account.token_expires_at <= utcnow() + timedelta(minutes=5):
         await refresh_access_token(account, session)
 
-    base_delay = 5
+    base_delay = 3.0
 
     async with httpx.AsyncClient(timeout=60) as client:
         for attempt in range(max_retries + 1):
             response = await client.get(
                 url,
                 params=params,
-                headers={
-                    "Authorization": f"Bearer {account.access_token}",
-                },
+                headers={"Authorization": f"Bearer {account.access_token}"},
             )
 
-            # Access token vencido
             if response.status_code == 401:
-                new_token = await refresh_access_token(account, session)
-
+                token = await refresh_access_token(account, session)
                 response = await client.get(
                     url,
                     params=params,
-                    headers={
-                        "Authorization": f"Bearer {new_token}",
-                    },
+                    headers={"Authorization": f"Bearer {token}"},
                 )
 
-            # Mercado Libre está limitando las solicitudes
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
-
                 try:
-                    delay = (
-                        float(retry_after)
-                        if retry_after
-                        else base_delay * (2 ** attempt)
-                    )
-                except (TypeError, ValueError):
+                    delay = float(retry_after) if retry_after else base_delay * (2 ** attempt)
+                except ValueError:
                     delay = base_delay * (2 ** attempt)
 
-                # Máximo cinco minutos entre intentos
                 delay = min(delay, 300)
-
                 print(
                     {
-                        "event": "mercadolibre_rate_limit",
-                        "status_code": 429,
+                        "rate_limit": True,
                         "attempt": attempt + 1,
-                        "max_retries": max_retries,
                         "delay_seconds": delay,
-                        "request_url": str(response.request.url),
+                        "url": str(response.request.url),
                     }
                 )
-
                 await asyncio.sleep(delay)
                 continue
 
-            # Errores temporales del servidor de Mercado Libre
-            if response.status_code in (500, 502, 503, 504):
-                delay = min(base_delay * (2 ** attempt), 180)
-
+            if 500 <= response.status_code < 600:
+                delay = min(base_delay * (2 ** attempt), 120)
                 print(
                     {
-                        "event": "mercadolibre_temporary_error",
-                        "status_code": response.status_code,
+                        "temporary_meli_error": response.status_code,
                         "attempt": attempt + 1,
-                        "max_retries": max_retries,
                         "delay_seconds": delay,
                     }
                 )
-
                 await asyncio.sleep(delay)
                 continue
 
@@ -395,8 +405,7 @@ async def meli_get(
             return response.json()
 
     raise RuntimeError(
-        "Mercado Libre continuó respondiendo con límites o errores "
-        f"temporales después de {max_retries + 1} intentos."
+        f"Mercado Libre siguió respondiendo 429/5xx después de {max_retries + 1} intentos."
     )
 
 
@@ -594,7 +603,7 @@ async def process_historical_job(job_id: str) -> None:
                         if offset >= total or processed_now < 50:
                             break
 
-                        await asyncio.sleep(1.25)
+                        await asyncio.sleep(0.75)
 
                     job = chunk_session.get(SyncJob, job_id)
                     if job is None:
@@ -654,12 +663,23 @@ async def sync_worker_loop() -> None:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "0.5.0"}
+    return {"service": "GETAC ERP API", "status": "online", "version": "0.7.1", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "timestamp": utcnow().isoformat()}
+
+@app.get("/health/service")
+def service_health() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "version": "0.7.1",
+        "service_role": SERVICE_ROLE,
+        "worker_enabled": SERVICE_ROLE in ("all", "worker"),
+        "worker_running": bool(worker_task and not worker_task.done()),
+        "timestamp": utcnow().isoformat(),
+    }
 
 
 @app.get("/health/database")
@@ -968,153 +988,183 @@ async def mercadolibre_webhook(request: Request) -> JSONResponse:
 
     return JSONResponse(status_code=200, content={"status": "received"})
 @app.get("/api/dashboard/summary")
-def dashboard_summary(days: int = Query(default=30, ge=1, le=365)) -> JSONResponse:
+def dashboard_summary(
+    days: int = Query(default=30, ge=1, le=730),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+) -> JSONResponse:
     if SessionLocal is None:
         return JSONResponse(status_code=500, content={"error": "database_not_configured"})
 
-    now = utcnow()
-    since = now - timedelta(days=days)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday_start = today_start - timedelta(days=1)
+    try:
+        start, end = parse_date_range(date_from, date_to, days)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+    search_value = normalize_search(search)
+    category_value = normalize_search(category)
+
+    filters = """
+        o.marketplace = 'MERCADO_LIBRE'
+        AND o.date_created >= :start
+        AND o.date_created < :end
+        AND COALESCE(o.status, '') NOT IN ('cancelled', 'invalid')
+        AND (
+            :search_value = ''
+            OR UPPER(COALESCE(oi.seller_sku, '')) LIKE :search_like
+            OR UPPER(COALESCE(oi.title, '')) LIKE :search_like
+            OR UPPER(
+                CASE
+                    WHEN POSITION('-' IN COALESCE(oi.seller_sku, '')) > 0
+                        THEN SPLIT_PART(BTRIM(oi.seller_sku), '-', 1)
+                    ELSE BTRIM(COALESCE(oi.seller_sku, ''))
+                END
+            ) LIKE :search_like
+        )
+        AND (
+            :category_value = ''
+            OR UPPER(COALESCE(oi.raw_data #>> '{item,category_id}', '')) LIKE :category_like
+            OR UPPER(COALESCE(oi.raw_data #>> '{item,domain_id}', '')) LIKE :category_like
+            OR UPPER(COALESCE(oi.title, '')) LIKE :category_like
+        )
+    """
+
+    params = {
+        "start": start,
+        "end": end,
+        "search_value": search_value,
+        "search_like": f"%{search_value}%",
+        "category_value": category_value,
+        "category_like": f"%{category_value}%",
+    }
 
     with SessionLocal() as session:
         totals = session.execute(
             text(
-                """
-                WITH filtered_orders AS (
+                f"""
+                WITH filtered AS (
                     SELECT
-                        id,
-                        external_order_id,
-                        paid_amount,
-                        date_created,
-                        status
-                    FROM orders
-                    WHERE marketplace = 'MERCADO_LIBRE'
-                      AND date_created >= :since
+                        o.id AS order_id,
+                        o.external_order_id,
+                        o.paid_amount,
+                        oi.quantity
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    WHERE {filters}
                 ),
-                item_totals AS (
+                order_totals AS (
                     SELECT
                         order_id,
-                        COALESCE(SUM(quantity), 0) AS units
-                    FROM order_items
+                        MAX(external_order_id) AS external_order_id,
+                        MAX(paid_amount) AS paid_amount,
+                        SUM(quantity) AS units
+                    FROM filtered
                     GROUP BY order_id
                 )
                 SELECT
                     COUNT(*) AS orders,
-                    COALESCE(SUM(fo.paid_amount), 0) AS paid_amount,
-                    COALESCE(SUM(it.units), 0) AS units,
-                    COALESCE(AVG(fo.paid_amount), 0) AS average_ticket,
-                    COUNT(*) FILTER (
-                        WHERE fo.status IN ('cancelled', 'invalid')
-                    ) AS cancelled_orders
-                FROM filtered_orders fo
-                LEFT JOIN item_totals it ON it.order_id = fo.id
+                    COALESCE(SUM(units), 0) AS units,
+                    COALESCE(SUM(paid_amount), 0) AS paid_amount,
+                    COALESCE(AVG(paid_amount), 0) AS average_ticket
+                FROM order_totals
                 """
             ),
-            {"since": since},
-        ).mappings().one()
-
-        today = session.execute(
-            text(
-                """
-                SELECT
-                    COUNT(*) AS orders,
-                    COALESCE(SUM(paid_amount), 0) AS paid_amount
-                FROM orders
-                WHERE marketplace = 'MERCADO_LIBRE'
-                  AND date_created >= :today_start
-                """
-            ),
-            {"today_start": today_start},
-        ).mappings().one()
-
-        yesterday = session.execute(
-            text(
-                """
-                SELECT
-                    COUNT(*) AS orders,
-                    COALESCE(SUM(paid_amount), 0) AS paid_amount
-                FROM orders
-                WHERE marketplace = 'MERCADO_LIBRE'
-                  AND date_created >= :yesterday_start
-                  AND date_created < :today_start
-                """
-            ),
-            {
-                "yesterday_start": yesterday_start,
-                "today_start": today_start,
-            },
+            params,
         ).mappings().one()
 
         daily_rows = session.execute(
             text(
-                """
+                f"""
+                WITH filtered_orders AS (
+                    SELECT DISTINCT
+                        o.id,
+                        o.date_created,
+                        o.paid_amount
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    WHERE {filters}
+                )
                 SELECT
                     DATE(date_created AT TIME ZONE 'America/Mexico_City') AS sale_date,
                     COUNT(*) AS orders,
                     COALESCE(SUM(paid_amount), 0) AS paid_amount
-                FROM orders
-                WHERE marketplace = 'MERCADO_LIBRE'
-                  AND date_created >= :since
+                FROM filtered_orders
                 GROUP BY 1
                 ORDER BY 1
                 """
             ),
-            {"since": since},
+            params,
         ).mappings().all()
 
         top_skus = session.execute(
             text(
-                """
+                f"""
                 SELECT
-                    COALESCE(NULLIF(oi.seller_sku, ''), 'SIN SKU') AS sku,
+                    COALESCE(NULLIF(UPPER(BTRIM(oi.seller_sku)), ''), 'SIN SKU') AS sku,
                     MAX(oi.title) AS title,
                     COALESCE(SUM(oi.quantity), 0) AS units,
                     COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS gross_sales
                 FROM order_items oi
                 JOIN orders o ON o.id = oi.order_id
-                WHERE o.marketplace = 'MERCADO_LIBRE'
-                  AND o.date_created >= :since
-                  AND COALESCE(o.status, '') NOT IN ('cancelled', 'invalid')
+                WHERE {filters}
                 GROUP BY 1
                 ORDER BY units DESC, gross_sales DESC
-                LIMIT 10
+                LIMIT 25
                 """
             ),
-            {"since": since},
+            params,
         ).mappings().all()
 
         status_rows = session.execute(
             text(
-                """
+                f"""
                 SELECT
-                    COALESCE(status, 'unknown') AS status,
-                    COUNT(*) AS orders
-                FROM orders
-                WHERE marketplace = 'MERCADO_LIBRE'
-                  AND date_created >= :since
+                    COALESCE(o.status, 'unknown') AS status,
+                    COUNT(DISTINCT o.id) AS orders
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                WHERE {filters}
                 GROUP BY 1
                 ORDER BY orders DESC
                 """
             ),
-            {"since": since},
+            params,
         ).mappings().all()
+
+        categories = session.execute(
+            text(
+                """
+                SELECT DISTINCT category_value
+                FROM (
+                    SELECT
+                        NULLIF(UPPER(COALESCE(oi.raw_data #>> '{item,category_id}', '')), '') AS category_value
+                    FROM order_items oi
+                    UNION
+                    SELECT
+                        NULLIF(UPPER(COALESCE(oi.raw_data #>> '{item,domain_id}', '')), '') AS category_value
+                    FROM order_items oi
+                ) q
+                WHERE category_value IS NOT NULL
+                ORDER BY category_value
+                LIMIT 500
+                """
+            )
+        ).scalars().all()
 
     return JSONResponse(
         content={
             "status": "ok",
-            "period_days": days,
-            "generated_at": now.isoformat(),
+            "date_from": start.date().isoformat(),
+            "date_to": (end - timedelta(days=1)).date().isoformat(),
+            "search": search or "",
+            "category": category or "",
             "metrics": {
                 "orders": int(totals["orders"] or 0),
                 "units": int(totals["units"] or 0),
                 "paid_amount": float(totals["paid_amount"] or 0),
                 "average_ticket": float(totals["average_ticket"] or 0),
-                "cancelled_orders": int(totals["cancelled_orders"] or 0),
-                "today_orders": int(today["orders"] or 0),
-                "today_paid_amount": float(today["paid_amount"] or 0),
-                "yesterday_orders": int(yesterday["orders"] or 0),
-                "yesterday_paid_amount": float(yesterday["paid_amount"] or 0),
             },
             "daily_sales": [
                 {
@@ -1134,219 +1184,229 @@ def dashboard_summary(days: int = Query(default=30, ge=1, le=365)) -> JSONRespon
                 for row in top_skus
             ],
             "order_statuses": [
+                {"status": row["status"], "orders": int(row["orders"] or 0)}
+                for row in status_rows
+            ],
+            "categories": categories,
+        }
+    )
+
+
+@app.get("/api/products/models")
+def product_models(
+    days: int = Query(default=30, ge=1, le=730),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(status_code=500, content={"error": "database_not_configured"})
+
+    try:
+        start, end = parse_date_range(date_from, date_to, days)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+    search_value = normalize_search(search)
+    category_value = normalize_search(category)
+
+    with SessionLocal() as session:
+        rows = session.execute(
+            text(
+                """
+                WITH parsed_items AS (
+                    SELECT
+                        o.id AS order_id,
+                        oi.seller_sku,
+                        oi.title,
+                        oi.quantity,
+                        oi.unit_price,
+                        CASE
+                            WHEN oi.seller_sku IS NULL OR BTRIM(oi.seller_sku) = ''
+                                THEN 'SIN MODELO'
+                            WHEN POSITION('-' IN oi.seller_sku) > 0
+                                THEN SPLIT_PART(UPPER(BTRIM(oi.seller_sku)), '-', 1)
+                            ELSE UPPER(BTRIM(oi.seller_sku))
+                        END AS product_model,
+                        CASE
+                            WHEN ARRAY_LENGTH(STRING_TO_ARRAY(oi.seller_sku, '-'), 1) >= 2
+                                THEN SPLIT_PART(UPPER(BTRIM(oi.seller_sku)), '-', 2)
+                            ELSE NULL
+                        END AS product_color,
+                        CASE
+                            WHEN ARRAY_LENGTH(STRING_TO_ARRAY(oi.seller_sku, '-'), 1) >= 3
+                                THEN (
+                                    STRING_TO_ARRAY(UPPER(BTRIM(oi.seller_sku)), '-')
+                                )[ARRAY_LENGTH(STRING_TO_ARRAY(oi.seller_sku, '-'), 1)]
+                            ELSE NULL
+                        END AS product_size
+                    FROM order_items oi
+                    JOIN orders o ON o.id = oi.order_id
+                    WHERE o.marketplace = 'MERCADO_LIBRE'
+                      AND o.date_created >= :start
+                      AND o.date_created < :end
+                      AND COALESCE(o.status, '') NOT IN ('cancelled', 'invalid')
+                      AND (
+                          :search_value = ''
+                          OR UPPER(COALESCE(oi.seller_sku, '')) LIKE :search_like
+                          OR UPPER(COALESCE(oi.title, '')) LIKE :search_like
+                          OR UPPER(
+                              CASE
+                                  WHEN POSITION('-' IN COALESCE(oi.seller_sku, '')) > 0
+                                      THEN SPLIT_PART(BTRIM(oi.seller_sku), '-', 1)
+                                  ELSE BTRIM(COALESCE(oi.seller_sku, ''))
+                              END
+                          ) LIKE :search_like
+                      )
+                      AND (
+                          :category_value = ''
+                          OR UPPER(COALESCE(oi.raw_data #>> '{item,category_id}', '')) LIKE :category_like
+                          OR UPPER(COALESCE(oi.raw_data #>> '{item,domain_id}', '')) LIKE :category_like
+                          OR UPPER(COALESCE(oi.title, '')) LIKE :category_like
+                      )
+                )
+                SELECT
+                    product_model,
+                    MAX(title) AS example_title,
+                    COUNT(DISTINCT seller_sku) AS sku_count,
+                    COUNT(DISTINCT product_color)
+                        FILTER (WHERE product_color IS NOT NULL) AS color_count,
+                    COUNT(DISTINCT product_size)
+                        FILTER (WHERE product_size IS NOT NULL) AS size_count,
+                    COALESCE(SUM(quantity), 0) AS units,
+                    COALESCE(SUM(quantity * unit_price), 0) AS gross_sales,
+                    COUNT(DISTINCT order_id) AS orders
+                FROM parsed_items
+                GROUP BY product_model
+                ORDER BY units DESC, gross_sales DESC
+                LIMIT :limit
+                """
+            ),
+            {
+                "start": start,
+                "end": end,
+                "search_value": search_value,
+                "search_like": f"%{search_value}%",
+                "category_value": category_value,
+                "category_like": f"%{category_value}%",
+                "limit": limit,
+            },
+        ).mappings().all()
+
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "date_from": start.date().isoformat(),
+            "date_to": (end - timedelta(days=1)).date().isoformat(),
+            "models": [
                 {
-                    "status": row["status"],
+                    "model": row["product_model"],
+                    "title": row["example_title"],
+                    "sku_count": int(row["sku_count"] or 0),
+                    "color_count": int(row["color_count"] or 0),
+                    "size_count": int(row["size_count"] or 0),
+                    "units": int(row["units"] or 0),
+                    "gross_sales": float(row["gross_sales"] or 0),
                     "orders": int(row["orders"] or 0),
                 }
-                for row in status_rows
+                for row in rows
             ],
         }
     )
 
 
-@app.post("/sync/mercadolibre/historical")
-def create_historical_sync(
-    days: int = Query(default=365, ge=1, le=730),
+@app.get("/api/products/models/{model}")
+def product_model_detail(
+    model: str,
+    days: int = Query(default=30, ge=1, le=365),
 ) -> JSONResponse:
-    if SessionLocal is None:
-        return JSONResponse(status_code=500, content={"error": "database_not_configured"})
-
-    with SessionLocal() as session:
-        account = get_account(session)
-        if account is None:
-            return JSONResponse(status_code=400, content={"error": "mercadolibre_not_connected"})
-
-        existing = session.scalar(
-            select(SyncJob).where(
-                SyncJob.marketplace == "MERCADO_LIBRE",
-                SyncJob.job_type == "HISTORICAL_ORDERS",
-                SyncJob.status.in_(["PENDING", "RUNNING"]),
-            )
-        )
-        if existing is not None:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "status": "already_running",
-                    "job_id": existing.id,
-                    "message": "Ya existe una sincronización histórica activa.",
-                },
-            )
-
-        end = utcnow()
-        start = end - timedelta(days=days)
-        chunks = build_six_hour_chunks(start, end)
-        job = SyncJob(
-            id=str(uuid.uuid4()),
-            marketplace="MERCADO_LIBRE",
-            job_type="HISTORICAL_ORDERS",
-            status="PENDING",
-            date_from=start,
-            date_to=end,
-            total_chunks=len(chunks),
-        )
-        session.add(job)
-        session.commit()
-
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "queued",
-                "job_id": job.id,
-                "days": days,
-                "total_chunks": len(chunks),
-                "status_url": f"/sync/jobs/{job.id}",
-            },
-        )
-
-
-@app.get("/sync/jobs/{job_id}")
-def get_sync_job(job_id: str) -> JSONResponse:
-    if SessionLocal is None:
-        return JSONResponse(status_code=500, content={"error": "database_not_configured"})
-
-    with SessionLocal() as session:
-        job = session.get(SyncJob, job_id)
-        if job is None:
-            return JSONResponse(status_code=404, content={"error": "job_not_found"})
-
-        progress = 0.0
-        if job.total_chunks:
-            progress = round((job.chunks_completed / job.total_chunks) * 100, 2)
-
-        return JSONResponse(
-            content={
-                "job_id": job.id,
-                "marketplace": job.marketplace,
-                "job_type": job.job_type,
-                "status": job.status,
-                "date_from": job.date_from.isoformat(),
-                "date_to": job.date_to.isoformat(),
-                "orders_processed": job.orders_processed,
-                "chunks_completed": job.chunks_completed,
-                "total_chunks": job.total_chunks,
-                "progress_percent": progress,
-                "current_chunk_from": job.current_chunk_from.isoformat() if job.current_chunk_from else None,
-                "current_chunk_to": job.current_chunk_to.isoformat() if job.current_chunk_to else None,
-                "started_at": job.started_at.isoformat() if job.started_at else None,
-                "finished_at": job.finished_at.isoformat() if job.finished_at else None,
-                "last_error": job.last_error,
-            }
-        )
-
-
-@app.get("/sync/jobs")
-def list_sync_jobs(limit: int = Query(default=20, ge=1, le=100)) -> JSONResponse:
-    if SessionLocal is None:
-        return JSONResponse(status_code=500, content={"error": "database_not_configured"})
-
-    with SessionLocal() as session:
-        jobs = session.scalars(
-            select(SyncJob).order_by(SyncJob.created_at.desc()).limit(limit)
-        ).all()
-
-        return JSONResponse(
-            content={
-                "jobs": [
-                    {
-                        "job_id": job.id,
-                        "status": job.status,
-                        "orders_processed": job.orders_processed,
-                        "chunks_completed": job.chunks_completed,
-                        "total_chunks": job.total_chunks,
-                        "created_at": job.created_at.isoformat(),
-                    }
-                    for job in jobs
-                ]
-            }
-        )
-
-@app.post("/sync/jobs/{job_id}/resume")
-def resume_sync_job(job_id: str) -> JSONResponse:
     if SessionLocal is None:
         return JSONResponse(
             status_code=500,
             content={"error": "database_not_configured"},
         )
 
+    since = utcnow() - timedelta(days=days)
+    normalized_model = model.strip().upper()
+
     with SessionLocal() as session:
-        job = session.get(SyncJob, job_id)
+        rows = session.execute(
+            text(
+                """
+                SELECT
+                    UPPER(BTRIM(oi.seller_sku)) AS sku,
+                    MAX(oi.title) AS title,
+                    CASE
+                        WHEN ARRAY_LENGTH(STRING_TO_ARRAY(oi.seller_sku, '-'), 1) >= 2
+                            THEN SPLIT_PART(
+                                UPPER(BTRIM(oi.seller_sku)),
+                                '-',
+                                2
+                            )
+                        ELSE NULL
+                    END AS color,
+                    CASE
+                        WHEN ARRAY_LENGTH(STRING_TO_ARRAY(oi.seller_sku, '-'), 1) >= 3
+                            THEN (
+                                STRING_TO_ARRAY(
+                                    UPPER(BTRIM(oi.seller_sku)),
+                                    '-'
+                                )
+                            )[ARRAY_LENGTH(STRING_TO_ARRAY(oi.seller_sku, '-'), 1)]
+                        ELSE NULL
+                    END AS size,
+                    COALESCE(SUM(oi.quantity), 0) AS units,
+                    COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS gross_sales,
+                    COUNT(DISTINCT o.external_order_id) AS orders
+                FROM order_items oi
+                JOIN orders o ON o.id = oi.order_id
+                WHERE o.marketplace = 'MERCADO_LIBRE'
+                  AND o.date_created >= :since
+                  AND COALESCE(o.status, '') NOT IN ('cancelled', 'invalid')
+                  AND (
+                      CASE
+                          WHEN POSITION('-' IN oi.seller_sku) > 0
+                              THEN SPLIT_PART(UPPER(BTRIM(oi.seller_sku)), '-', 1)
+                          ELSE UPPER(BTRIM(oi.seller_sku))
+                      END
+                  ) = :model
+                GROUP BY
+                    UPPER(BTRIM(oi.seller_sku)),
+                    color,
+                    size
+                ORDER BY units DESC, sku
+                """
+            ),
+            {"since": since, "model": normalized_model},
+        ).mappings().all()
 
-        if job is None:
-            return JSONResponse(
-                status_code=404,
-                content={"error": "job_not_found"},
-            )
-
-        if job.status not in ("ERROR", "CANCELLED"):
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": "job_not_resumable",
-                    "status": job.status,
-                },
-            )
-
-        active_job = session.scalar(
-            select(SyncJob).where(
-                SyncJob.id != job_id,
-                SyncJob.marketplace == job.marketplace,
-                SyncJob.status.in_(["PENDING", "RUNNING"]),
-            )
-        )
-
-        if active_job is not None:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": "another_job_active",
-                    "active_job_id": active_job.id,
-                },
-            )
-
-        job.status = "PENDING"
-        job.last_error = None
-        job.finished_at = None
-        job.updated_at = utcnow()
-
-        session.commit()
-
-        progress = 0
-        if job.total_chunks:
-            progress = round(
-                (job.chunks_completed / job.total_chunks) * 100,
-                2,
-            )
-
+    if not rows:
         return JSONResponse(
-            status_code=202,
-            content={
-                "status": "queued",
-                "job_id": job.id,
-                "resume_from_chunk": job.chunks_completed,
-                "progress_percent": progress,
-            },
+            status_code=404,
+            content={"error": "model_not_found", "model": normalized_model},
         )
-@app.post("/sync/jobs/{job_id}/cancel")
-def cancel_sync_job(job_id: str) -> JSONResponse:
-    if SessionLocal is None:
-        return JSONResponse(status_code=500, content={"error": "database_not_configured"})
 
-    with SessionLocal() as session:
-        job = session.get(SyncJob, job_id)
-        if job is None:
-            return JSONResponse(status_code=404, content={"error": "job_not_found"})
-        if job.status in ("SUCCESS", "ERROR", "CANCELLED"):
-            return JSONResponse(
-                status_code=409,
-                content={"error": "job_not_active", "status": job.status},
-            )
-
-        job.status = "CANCELLED"
-        job.finished_at = utcnow()
-        job.updated_at = utcnow()
-        session.commit()
-        return JSONResponse(content={"status": "cancelled", "job_id": job.id})
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "model": normalized_model,
+            "days": days,
+            "variants": [
+                {
+                    "sku": row["sku"],
+                    "title": row["title"],
+                    "color": row["color"],
+                    "size": row["size"],
+                    "units": int(row["units"] or 0),
+                    "gross_sales": float(row["gross_sales"] or 0),
+                    "orders": int(row["orders"] or 0),
+                }
+                for row in rows
+            ],
+        }
+    )
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -1471,14 +1531,23 @@ def dashboard() -> HTMLResponse:
         <h1>Dashboard de ventas</h1>
         <div class="subtitle">Mercado Libre · Cuenta GETAC</div>
       </div>
-      <div class="controls">
+      <div class="controls" style="flex-wrap:wrap">
         <select id="days">
           <option value="7">Últimos 7 días</option>
           <option value="30" selected>Últimos 30 días</option>
           <option value="90">Últimos 90 días</option>
           <option value="365">Últimos 365 días</option>
+          <option value="custom">Fechas específicas</option>
         </select>
-        <button onclick="loadDashboard()">Actualizar</button>
+        <input id="dateFrom" type="date" style="display:none;border:1px solid var(--border);padding:10px;border-radius:10px">
+        <input id="dateTo" type="date" style="display:none;border:1px solid var(--border);padding:10px;border-radius:10px">
+        <input id="searchInput" type="search" placeholder="Buscar SKU, modelo o producto"
+               style="min-width:240px;border:1px solid var(--border);padding:10px;border-radius:10px">
+        <select id="categoryFilter" style="min-width:200px">
+          <option value="">Todas las categorías</option>
+        </select>
+        <button onclick="loadDashboard()">Aplicar filtros</button>
+        <button onclick="clearFilters()">Limpiar</button>
       </div>
     </div>
 
@@ -1490,7 +1559,10 @@ def dashboard() -> HTMLResponse:
           <h2 style="margin-bottom:6px">Sincronización histórica</h2>
           <div id="syncStatus" class="subtitle">Sin trabajo activo</div>
         </div>
-        <button onclick="startHistoricalSync()">Sincronizar 365 días</button>
+        <div style="display:flex;gap:10px">
+          <button id="resumeButton" onclick="resumeHistoricalSync()" style="display:none">Reanudar</button>
+          <button onclick="startHistoricalSync()">Sincronizar 365 días</button>
+        </div>
       </div>
       <div style="margin-top:14px;background:#eef1f5;border-radius:999px;height:10px;overflow:hidden">
         <div id="syncProgress" style="height:100%;width:0%;background:#111827;transition:width .3s"></div>
@@ -1514,9 +1586,9 @@ def dashboard() -> HTMLResponse:
         <div id="unitsPerOrder" class="foot">0 por orden</div>
       </div>
       <div class="card">
-        <div class="label">Ventas hoy</div>
-        <div id="todaySales" class="value">$0</div>
-        <div id="todayOrders" class="foot">0 órdenes</div>
+        <div class="label">Periodo seleccionado</div>
+        <div id="selectedRange" class="value" style="font-size:18px">—</div>
+        <div id="filterSummary" class="foot">Sin filtros adicionales</div>
       </div>
     </section>
 
@@ -1528,6 +1600,29 @@ def dashboard() -> HTMLResponse:
       <div class="panel">
         <h2>Estatus de las órdenes</h2>
         <div class="chart-wrap"><canvas id="statusChart"></canvas></div>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-bottom:16px">
+      <h2>Top modelos agrupados</h2>
+      <div class="subtitle" style="margin-bottom:12px">
+        Ejemplo: MY2307-BLK-29 y MY2307-BLK-30 se muestran juntos como MY2307.
+      </div>
+      <div style="overflow:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Modelo</th>
+              <th>Producto</th>
+              <th class="num">SKUs</th>
+              <th class="num">Colores</th>
+              <th class="num">Tallas</th>
+              <th class="num">Unidades</th>
+              <th class="num">Venta bruta</th>
+            </tr>
+          </thead>
+          <tbody id="topModelBody"></tbody>
+        </table>
       </div>
     </section>
 
@@ -1568,13 +1663,47 @@ function showError(message) {
 async function loadDashboard() {
   document.getElementById('loading').style.display = 'flex';
   document.getElementById('error').style.display = 'none';
-  const days = document.getElementById('days').value;
+  const daysValue = document.getElementById('days').value;
+  const dateFrom = document.getElementById('dateFrom').value;
+  const dateTo = document.getElementById('dateTo').value;
+  const search = document.getElementById('searchInput').value.trim();
+  const category = document.getElementById('categoryFilter').value;
+
+  const params = new URLSearchParams();
+  if (daysValue === 'custom') {
+    if (!dateFrom || !dateTo) {
+      showError('Selecciona la fecha inicial y final.');
+      document.getElementById('loading').style.display = 'none';
+      return;
+    }
+    params.set('date_from', dateFrom);
+    params.set('date_to', dateTo);
+  } else {
+    params.set('days', daysValue);
+  }
+  if (search) params.set('search', search);
+  if (category) params.set('category', category);
 
   try {
-    const response = await fetch(`/api/dashboard/summary?days=${days}`, {cache:'no-store'});
+    const response = await fetch(`/api/dashboard/summary?${params.toString()}`, {cache:'no-store'});
     if (!response.ok) throw new Error(`Error ${response.status}`);
     const data = await response.json();
     const m = data.metrics;
+
+    const categorySelect = document.getElementById('categoryFilter');
+    const currentCategory = categorySelect.value;
+    const knownOptions = new Set(
+      Array.from(categorySelect.options).map(option => option.value)
+    );
+    (data.categories || []).forEach(value => {
+      if (!knownOptions.has(value)) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = value;
+        categorySelect.appendChild(option);
+      }
+    });
+    categorySelect.value = currentCategory;
 
     document.getElementById('paidAmount').textContent = money.format(m.paid_amount);
     document.getElementById('orders').textContent = integer.format(m.orders);
@@ -1583,10 +1712,14 @@ async function loadDashboard() {
       `Ticket promedio: ${money.format(m.average_ticket)}`;
     document.getElementById('unitsPerOrder').textContent =
       `${m.orders ? (m.units / m.orders).toFixed(2) : '0'} por orden`;
-    document.getElementById('todaySales').textContent = money.format(m.today_paid_amount);
-    document.getElementById('todayOrders').textContent =
-      `${integer.format(m.today_orders)} órdenes`;
-    document.getElementById('periodLabel').textContent = `Últimos ${days} días`;
+    document.getElementById('selectedRange').textContent =
+      `${data.date_from} a ${data.date_to}`;
+    document.getElementById('filterSummary').textContent =
+      [data.search ? `Búsqueda: ${data.search}` : '',
+       data.category ? `Categoría: ${data.category}` : '']
+      .filter(Boolean).join(' · ') || 'Sin filtros adicionales';
+    document.getElementById('periodLabel').textContent =
+      `${data.date_from} a ${data.date_to}`;
 
     const salesCtx = document.getElementById('salesChart');
     if (salesChart) salesChart.destroy();
@@ -1631,6 +1764,33 @@ async function loadDashboard() {
         plugins:{legend:{position:'bottom'}}
       }
     });
+
+    const modelsResponse = await fetch(
+      `/api/products/models?${params.toString()}&limit=50`,
+      {cache:'no-store'}
+    );
+    if (!modelsResponse.ok) throw new Error(`Error modelos ${modelsResponse.status}`);
+    const modelsData = await modelsResponse.json();
+
+    document.getElementById('topModelBody').innerHTML = modelsData.models.map(row => `
+      <tr>
+        <td>
+          <a href="/api/products/models/${encodeURIComponent(row.model)}?days=${days}"
+             target="_blank"
+             style="color:inherit;font-weight:800">
+            ${escapeHtml(row.model)}
+          </a>
+        </td>
+        <td class="sku-title" title="${escapeHtml(row.title || '')}">
+          ${escapeHtml(row.title || '')}
+        </td>
+        <td class="num">${integer.format(row.sku_count)}</td>
+        <td class="num">${integer.format(row.color_count)}</td>
+        <td class="num">${integer.format(row.size_count)}</td>
+        <td class="num">${integer.format(row.units)}</td>
+        <td class="num">${money.format(row.gross_sales)}</td>
+      </tr>
+    `).join('');
 
     document.getElementById('topSkuBody').innerHTML = data.top_skus.map(row => `
       <tr>
@@ -1684,12 +1844,27 @@ async function discoverActiveSync() {
     const response = await fetch('/sync/jobs?limit=5', {cache:'no-store'});
     if (!response.ok) return;
     const data = await response.json();
-    const active = (data.jobs || []).find(x => ['PENDING','RUNNING'].includes(x.status));
-    if (active) {
-      currentSyncJobId = active.job_id;
+    const latest = (data.jobs || [])[0];
+    if (latest) {
+      currentSyncJobId = latest.job_id;
       pollSyncStatus();
     }
   } catch (_) {}
+}
+
+async function resumeHistoricalSync() {
+  if (!currentSyncJobId) return;
+  try {
+    const response = await fetch(`/sync/jobs/${currentSyncJobId}/resume`, {method:'POST'});
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || `Error ${response.status}`);
+    }
+    document.getElementById('resumeButton').style.display = 'none';
+    pollSyncStatus();
+  } catch (error) {
+    showError(`No se pudo reanudar: ${error.message}`);
+  }
 }
 
 async function pollSyncStatus() {
@@ -1701,7 +1876,11 @@ async function pollSyncStatus() {
     document.getElementById('syncProgress').style.width = `${job.progress_percent || 0}%`;
     document.getElementById('syncStatus').textContent =
       `${job.status} · ${integer.format(job.orders_processed)} órdenes · ` +
-      `${job.progress_percent}% (${job.chunks_completed}/${job.total_chunks} bloques)`;
+      `${job.progress_percent}% (${job.chunks_completed}/${job.total_chunks} bloques)` +
+      (job.last_error ? ` · ${job.last_error}` : '');
+
+    const resumeButton = document.getElementById('resumeButton');
+    resumeButton.style.display = ['ERROR','CANCELLED'].includes(job.status) ? 'inline-block' : 'none';
 
     if (['PENDING','RUNNING'].includes(job.status)) {
       setTimeout(pollSyncStatus, 5000);
@@ -1713,7 +1892,33 @@ async function pollSyncStatus() {
   }
 }
 
-document.getElementById('days').addEventListener('change', loadDashboard);
+
+function updateDateControls() {
+  const custom = document.getElementById('days').value === 'custom';
+  document.getElementById('dateFrom').style.display = custom ? 'inline-block' : 'none';
+  document.getElementById('dateTo').style.display = custom ? 'inline-block' : 'none';
+}
+
+function clearFilters() {
+  document.getElementById('days').value = '30';
+  document.getElementById('dateFrom').value = '';
+  document.getElementById('dateTo').value = '';
+  document.getElementById('searchInput').value = '';
+  document.getElementById('categoryFilter').value = '';
+  updateDateControls();
+  loadDashboard();
+}
+
+document.getElementById('searchInput').addEventListener('keydown', event => {
+  if (event.key === 'Enter') loadDashboard();
+});
+
+document.getElementById('days').addEventListener('change', () => {
+  updateDateControls();
+  if (document.getElementById('days').value !== 'custom') loadDashboard();
+});
+
+updateDateControls();
 loadDashboard();
 discoverActiveSync();
 </script>

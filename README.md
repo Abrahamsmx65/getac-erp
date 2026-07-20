@@ -1,33 +1,28 @@
-# GETAC ERP v0.5 — Sincronización masiva
+# GETAC ERP v0.7.1 — Fechas y filtros
 
-Esta versión elimina el límite artificial de 5,000 órdenes.
+Nuevas funciones del dashboard:
 
-## Funcionamiento
+- Rango de fechas personalizado
+- Atajos de 7, 30, 90 y 365 días
+- Buscador por SKU
+- Buscador por modelo
+- Buscador por nombre de producto
+- Filtro por categoría o dominio de Mercado Libre
+- Gráficas y métricas recalculadas según los filtros
+- Top modelos y top SKUs filtrados
 
-- La carga histórica se ejecuta en segundo plano.
-- Divide el periodo en bloques de 6 horas.
-- Cada bloque se pagina en grupos de 50 órdenes.
-- El progreso se guarda en PostgreSQL.
-- Si Railway reinicia, el trabajo se retoma desde el último bloque guardado.
-- Solo se permite una carga histórica activa al mismo tiempo.
+## Uso
 
-## Iniciar desde el dashboard
+En el dashboard:
 
-Abre:
+1. Selecciona `Fechas específicas`
+2. Elige fecha inicial y fecha final
+3. Escribe un SKU, modelo o nombre si deseas
+4. Selecciona una categoría
+5. Presiona `Aplicar filtros`
 
-`/dashboard`
+## Nota de categoría
 
-Presiona:
-
-`Sincronizar 365 días`
-
-## Endpoints
-
-- `POST /sync/mercadolibre/historical?days=365`
-- `GET /sync/jobs`
-- `GET /sync/jobs/{job_id}`
-- `POST /sync/jobs/{job_id}/cancel`
-
-## Importante
-
-No cierres ni mantengas abierta una petición larga. El trabajo continúa en Railway aunque cierres la pestaña.
+El sistema utiliza `category_id` y `domain_id` cuando Mercado Libre los incluye
+dentro de la información de la orden. También permite coincidencias por el título
+del producto para categorías descriptivas.
