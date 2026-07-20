@@ -326,12 +326,13 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="0.9.0",
+    version="0.9.1",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
 worker_task: asyncio.Task | None = None
 daily_scheduler_task: asyncio.Task | None = None
+full_sync_tasks: dict[str, asyncio.Task] = {}
 
 
 @app.on_event("startup")
@@ -340,6 +341,24 @@ async def startup() -> None:
 
     if engine is not None:
         Base.metadata.create_all(bind=engine)
+
+        if SessionLocal is not None:
+            with SessionLocal() as session:
+                stale_runs = session.scalars(
+                    select(FullSyncRun).where(
+                        FullSyncRun.status.in_(
+                            ["PENDING", "RUNNING"]
+                        )
+                    )
+                ).all()
+                for stale_run in stale_runs:
+                    stale_run.status = "INTERRUPTED"
+                    stale_run.finished_at = utcnow()
+                    stale_run.last_error = (
+                        "Ejecución interrumpida por un despliegue "
+                        "o reinicio anterior."
+                    )
+                session.commit()
 
     if SERVICE_ROLE in ("all", "worker"):
         print({"service_role": SERVICE_ROLE, "worker": "started"})
@@ -786,7 +805,7 @@ async def sync_orders_for_exact_range(
                 if offset >= total or len(orders_data) < limit:
                     break
 
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.2)
 
             sync_log = session.get(SyncLog, log_id)
             if sync_log:
@@ -915,6 +934,7 @@ def extract_sku(data: dict[str, Any]) -> str | None:
         data.get("seller_custom_field"),
         data.get("seller_sku"),
         data.get("sku"),
+        data.get("seller_custom_field_id"),
     ]
 
     for candidate in candidates:
@@ -946,52 +966,68 @@ def build_order_sku_maps(
     dict[str, str],
     dict[str, str],
 ]:
+    """
+    Build reliable SKU maps from normalized order_items columns.
+
+    The previous version tried to read item_id and variation_id only
+    from raw JSON. Those values already exist in external_item_id and
+    variation_id, so using the columns is substantially more reliable.
+    """
+
     rows = session.execute(
-        text(
-            """
-            SELECT
-                UPPER(BTRIM(oi.seller_sku)) AS sku,
-                COALESCE(
-                    oi.raw_data #>> '{item,id}',
-                    oi.raw_data #>> '{item_id}',
-                    ''
-                ) AS item_id,
-                COALESCE(
-                    oi.raw_data #>> '{variation_id}',
-                    oi.raw_data #>> '{item,variation_id}',
-                    ''
-                ) AS variation_id,
-                COALESCE(
-                    oi.raw_data #>> '{inventory_id}',
-                    oi.raw_data #>> '{item,inventory_id}',
-                    ''
-                ) AS inventory_id
-            FROM order_items oi
-            WHERE oi.seller_sku IS NOT NULL
-              AND BTRIM(oi.seller_sku) <> ''
-            ORDER BY oi.id DESC
-            """
+        select(
+            OrderItem.external_item_id,
+            OrderItem.variation_id,
+            OrderItem.seller_sku,
+            OrderItem.raw_data,
         )
-    ).mappings().all()
+        .where(
+            OrderItem.seller_sku.is_not(None),
+            OrderItem.seller_sku != "",
+        )
+        .order_by(OrderItem.id.desc())
+    ).all()
 
     by_item_variation: dict[tuple[str, str], str] = {}
     by_inventory: dict[str, str] = {}
-    by_item: dict[str, str] = {}
+    item_candidates: dict[str, set[str]] = {}
 
-    for row in rows:
-        sku = row["sku"]
-        item_id = str(row["item_id"] or "").strip()
-        variation_id = str(row["variation_id"] or "").strip()
-        inventory_id = str(row["inventory_id"] or "").strip()
+    for external_item_id, variation_id, seller_sku, raw_data in rows:
+        sku = str(seller_sku or "").strip().upper()
+        if not sku:
+            continue
 
-        if item_id and variation_id:
-            by_item_variation.setdefault((item_id, variation_id), sku)
+        item_id = str(external_item_id or "").strip()
+        variation_text = (
+            str(variation_id).strip()
+            if variation_id is not None
+            else ""
+        )
 
+        if item_id and variation_text:
+            by_item_variation.setdefault(
+                (item_id, variation_text),
+                sku,
+            )
+
+        if item_id:
+            item_candidates.setdefault(item_id, set()).add(sku)
+
+        payload = raw_data or {}
+        inventory_id = (
+            payload.get("inventory_id")
+            or (payload.get("item") or {}).get("inventory_id")
+        )
         if inventory_id:
-            by_inventory.setdefault(inventory_id, sku)
+            by_inventory.setdefault(str(inventory_id), sku)
 
-        if item_id and not variation_id:
-            by_item.setdefault(item_id, sku)
+    # Only use item-only fallback when one item maps to exactly one SKU.
+    # This prevents assigning one size's SKU to every variation.
+    by_item = {
+        item_id: next(iter(skus))
+        for item_id, skus in item_candidates.items()
+        if len(skus) == 1
+    }
 
     return by_item_variation, by_inventory, by_item
 
@@ -1138,11 +1174,24 @@ async def sync_full_inventory_run(run_id: str) -> None:
                     session,
                 )
 
+                existing_row = session.get(
+                    FullInventory,
+                    record["inventory_id"],
+                )
+                resolved_sku = (
+                    record["sku"]
+                    or (
+                        existing_row.sku
+                        if existing_row and existing_row.sku
+                        else None
+                    )
+                )
+
                 row = FullInventory(
                     inventory_id=record["inventory_id"],
                     item_id=record["item_id"],
                     variation_id=record["variation_id"],
-                    sku=record["sku"],
+                    sku=resolved_sku,
                     title=record["title"],
                     category_id=record["category_id"],
                     total_quantity=int(stock.get("total") or 0),
@@ -1170,6 +1219,19 @@ async def sync_full_inventory_run(run_id: str) -> None:
             run.last_error = None
             session.commit()
 
+    except asyncio.CancelledError:
+        with SessionLocal() as session:
+            run = session.get(FullSyncRun, run_id)
+            if run:
+                run.status = "INTERRUPTED"
+                run.last_error = (
+                    "La actualización fue interrumpida por un reinicio "
+                    "del servidor. Presiona Actualizar stock FULL para "
+                    "continuar con una nueva ejecución."
+                )
+                run.finished_at = utcnow()
+                session.commit()
+        raise
     except Exception as exc:
         with SessionLocal() as session:
             run = session.get(FullSyncRun, run_id)
@@ -1178,11 +1240,13 @@ async def sync_full_inventory_run(run_id: str) -> None:
                 run.last_error = str(exc)[:4000]
                 run.finished_at = utcnow()
                 session.commit()
+    finally:
+        full_sync_tasks.pop(run_id, None)
 
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "0.9.0", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "0.9.1", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -1193,7 +1257,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "0.9.0",
+        "version": "0.9.1",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
@@ -2240,26 +2304,41 @@ async def start_full_sync() -> JSONResponse:
                 content={"error": "mercadolibre_not_connected"},
             )
 
-        active = session.scalar(
+        active_runs = session.scalars(
             select(FullSyncRun).where(
                 FullSyncRun.status.in_(["PENDING", "RUNNING"])
             )
-        )
-        if active:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "status": "already_running",
-                    "run_id": active.id,
-                },
+        ).all()
+
+        for active in active_runs:
+            task = full_sync_tasks.get(active.id)
+            if task is not None and not task.done():
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "status": "already_running",
+                        "run_id": active.id,
+                    },
+                )
+
+            # The database says RUNNING, but no process owns it.
+            # This happens after a Railway deployment or restart.
+            active.status = "INTERRUPTED"
+            active.finished_at = utcnow()
+            active.last_error = (
+                "Ejecución anterior interrumpida por reinicio "
+                "del servidor."
             )
+
+        session.commit()
 
         run = FullSyncRun(id=str(uuid.uuid4()), status="PENDING")
         session.add(run)
         session.commit()
         run_id = run.id
 
-    asyncio.create_task(sync_full_inventory_run(run_id))
+    task = asyncio.create_task(sync_full_inventory_run(run_id))
+    full_sync_tasks[run_id] = task
 
     return JSONResponse(
         status_code=202,
@@ -2284,6 +2363,17 @@ def full_sync_status() -> JSONResponse:
 
         if run is None:
             return JSONResponse(content={"status": "NEVER_RUN"})
+
+        if run.status in ("PENDING", "RUNNING"):
+            task = full_sync_tasks.get(run.id)
+            if task is None or task.done():
+                run.status = "INTERRUPTED"
+                run.finished_at = utcnow()
+                run.last_error = (
+                    "La actualización fue interrumpida por un "
+                    "reinicio del servidor."
+                )
+                session.commit()
 
         progress = 0.0
         if run.inventories_found:
@@ -2310,7 +2400,51 @@ def full_sync_status() -> JSONResponse:
                 if run.finished_at else None
             ),
             "last_error": run.last_error,
+            "task_active": bool(
+                full_sync_tasks.get(run.id)
+                and not full_sync_tasks[run.id].done()
+            ),
         })
+
+
+@app.get("/api/full/sku-diagnostics")
+def full_sku_diagnostics() -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    with SessionLocal() as session:
+        totals = session.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (
+                        WHERE sku IS NOT NULL
+                          AND BTRIM(sku) <> ''
+                    ) AS with_sku,
+                    COUNT(*) FILTER (
+                        WHERE sku IS NULL
+                           OR BTRIM(sku) = ''
+                    ) AS without_sku,
+                    COUNT(DISTINCT SPLIT_PART(sku, '-', 1))
+                        FILTER (
+                            WHERE sku IS NOT NULL
+                              AND BTRIM(sku) <> ''
+                        ) AS distinct_models
+                FROM full_inventory
+                """
+            )
+        ).mappings().one()
+
+    return JSONResponse(content={
+        "total": int(totals["total"] or 0),
+        "with_sku": int(totals["with_sku"] or 0),
+        "without_sku": int(totals["without_sku"] or 0),
+        "distinct_models": int(totals["distinct_models"] or 0),
+    })
 
 
 @app.get("/api/full/inventory")
@@ -2731,7 +2865,7 @@ border-radius:10px;margin-bottom:14px}
 <option value="90">Ventas 90 días</option></select>
 <input id="search" type="search" placeholder="Buscar SKU, producto o inventory ID">
 <button onclick="loadInventory()">Buscar</button>
-<button onclick="startSync()">Actualizar stock FULL</button>
+<button onclick="startSync()">Actualizar / reiniciar stock FULL</button>
 <button onclick="downloadShipment()">Descargar envío sugerido</button>
 </div>
 </div>
@@ -2820,6 +2954,10 @@ try{
 const r=await fetch('/sync/mercadolibre/full',{method:'POST'});
 const d=await r.json();
 if(!r.ok&&r.status!==409)throw new Error(d.error||'Error '+r.status);
+if(r.status===409){
+document.getElementById('syncText').textContent=
+'Ya existe una actualización activa.';
+}
 pollStatus();
 }catch(e){showError('No se pudo iniciar: '+e.message)}
 }

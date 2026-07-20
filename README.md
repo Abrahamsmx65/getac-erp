@@ -1,42 +1,42 @@
-# GETAC ERP v0.9 — Paquete completo
+# GETAC ERP v0.9.1 — Corrección de actualización FULL y SKU
 
-Incluye en un solo ZIP:
+## Problema corregido 1: actualización detenida
 
-## Dashboard
-- Ventas por 7, 30, 90 y 365 días
-- Fechas específicas
-- Buscador por SKU, modelo o producto
-- Filtro por categoría con nombres de Mercado Libre
-- Top modelos agrupados
-- Variantes separadas por SKU
+Cuando Railway despliega una versión nueva, las tareas en memoria terminan.
+La base de datos podía quedarse mostrando `RUNNING` para siempre.
 
-## Automatización
-- Sincronización automática diaria a la 1:00 AM
-- Zona horaria: America/Mexico_City
-- Descarga las órdenes del día anterior
-- Evita duplicados mediante UPSERT
-- Reintentos por errores 429 y 5xx
-- Página `/automation`
-- Botón `Sincronizar ayer ahora`
+Ahora:
 
-## Inventario FULL
-- Stock real por inventory_id
-- Corrección robusta de SKU
-- Ventas 7, 14 y 30 días
-- Promedio y cobertura
-- Recomendación de envío para 30 días
-- Excel descargable con cantidades sugeridas
+- Las ejecuciones interrumpidas se marcan `INTERRUPTED`.
+- El botón `Actualizar / reiniciar stock FULL` crea una ejecución nueva.
+- El endpoint de estado valida que exista una tarea real.
+- Al arrancar el servidor se limpian ejecuciones antiguas atascadas.
 
-## Rutas principales
-- `/dashboard`
-- `/full`
-- `/automation`
-- `/docs`
+## Problema corregido 2: solo aparecían SKU de GT110
 
-## Configuración
-Mantener en Railway:
+La relación estaba intentando leer item_id y variation_id desde el JSON.
+Ahora usa directamente:
 
-SERVICE_ROLE=all
+- `order_items.external_item_id`
+- `order_items.variation_id`
+- `order_items.seller_sku`
 
-No requiere variables nuevas.
-Las tablas nuevas se crean automáticamente al desplegar.
+También evita usar un SKU genérico del item cuando el mismo item tiene
+varias variantes, para no asignar el SKU de una talla a todas las demás.
+
+## Después de instalar
+
+1. Espera a que Railway quede Online.
+2. Abre `/full`.
+3. Presiona `Actualizar / reiniciar stock FULL`.
+4. La ejecución anterior en 600 se marcará como interrumpida.
+5. Se iniciará una actualización nueva con el cruce de SKU corregido.
+
+## Diagnóstico
+
+La ruta `/api/full/sku-diagnostics` muestra:
+
+- inventarios totales
+- inventarios con SKU
+- inventarios sin SKU
+- modelos distintos encontrados
