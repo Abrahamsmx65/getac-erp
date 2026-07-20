@@ -1,37 +1,23 @@
-# GETAC ERP v0.8 — Inventario FULL
+# GETAC ERP v0.8.2 — Corrección de SKU en FULL
 
-Incluye una nueva sección:
+Corrige los registros que aparecían como `SIN SKU`.
 
-`/full`
+## Fuentes utilizadas para resolver el SKU
 
-Muestra:
+1. `seller_custom_field` de la publicación.
+2. `seller_custom_field` de la variación.
+3. Atributos `SELLER_SKU`, `SELLER_CUSTOM_FIELD` o `SKU`.
+4. Historial de órdenes, relacionado por:
+   - Inventory ID
+   - Item ID + Variation ID
+   - Item ID
 
-- SKU
-- Producto
-- Inventory ID
-- Stock disponible en FULL
-- Stock no disponible
-- Ventas de los últimos 30 días
-- Promedio diario
-- Días estimados de inventario
-- Alertas por cobertura baja
-- Buscador
-- Botón para actualizar stock FULL
+## Qué hacer después de instalar
 
-## Primera ejecución
+1. Abre `/full`.
+2. Presiona `Actualizar stock FULL`.
+3. La actualización volverá a recorrer las publicaciones.
+4. Los registros existentes se actualizarán usando el mismo `inventory_id`.
+5. Los SKU encontrados reemplazarán los valores `SIN SKU`.
 
-Después del despliegue:
-
-1. Abre `/full`
-2. Presiona `Actualizar stock FULL`
-3. El sistema recorrerá las publicaciones y variaciones de la cuenta
-4. Consultará el stock real de cada `inventory_id`
-5. Guardará el resultado en PostgreSQL
-
-La primera actualización puede tardar por el número de publicaciones.
-Las siguientes consultas del dashboard usan PostgreSQL y son rápidas.
-
-## Tablas automáticas
-
-- `full_inventory`
-- `full_sync_runs`
+No es necesario borrar tablas ni volver a sincronizar las ventas.

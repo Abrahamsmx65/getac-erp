@@ -1,4 +1,6 @@
 import asyncio
+import io
+import math
 import os
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -8,7 +10,7 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -309,7 +311,7 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="0.8.0",
+    version="0.8.2",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
@@ -698,16 +700,89 @@ async def sync_worker_loop() -> None:
 
 
 def extract_sku(data: dict[str, Any]) -> str | None:
-    direct = data.get("seller_custom_field") or data.get("seller_sku")
-    if direct:
-        return str(direct).strip().upper()
+    candidates = [
+        data.get("seller_custom_field"),
+        data.get("seller_sku"),
+        data.get("sku"),
+    ]
+
+    for candidate in candidates:
+        if candidate is not None and str(candidate).strip():
+            return str(candidate).strip().upper()
 
     for attribute in data.get("attributes") or []:
-        if attribute.get("id") in ("SELLER_SKU", "SELLER_CUSTOM_FIELD"):
-            value = attribute.get("value_name") or attribute.get("value_id")
-            if value:
+        attribute_id = str(attribute.get("id") or "").upper()
+        if attribute_id in (
+            "SELLER_SKU",
+            "SELLER_CUSTOM_FIELD",
+            "SKU",
+        ):
+            value = (
+                attribute.get("value_name")
+                or attribute.get("value_id")
+                or attribute.get("value_struct", {}).get("number")
+            )
+            if value is not None and str(value).strip():
                 return str(value).strip().upper()
+
     return None
+
+
+def build_order_sku_maps(
+    session,
+) -> tuple[
+    dict[tuple[str, str], str],
+    dict[str, str],
+    dict[str, str],
+]:
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                UPPER(BTRIM(oi.seller_sku)) AS sku,
+                COALESCE(
+                    oi.raw_data #>> '{item,id}',
+                    oi.raw_data #>> '{item_id}',
+                    ''
+                ) AS item_id,
+                COALESCE(
+                    oi.raw_data #>> '{variation_id}',
+                    oi.raw_data #>> '{item,variation_id}',
+                    ''
+                ) AS variation_id,
+                COALESCE(
+                    oi.raw_data #>> '{inventory_id}',
+                    oi.raw_data #>> '{item,inventory_id}',
+                    ''
+                ) AS inventory_id
+            FROM order_items oi
+            WHERE oi.seller_sku IS NOT NULL
+              AND BTRIM(oi.seller_sku) <> ''
+            ORDER BY oi.id DESC
+            """
+        )
+    ).mappings().all()
+
+    by_item_variation: dict[tuple[str, str], str] = {}
+    by_inventory: dict[str, str] = {}
+    by_item: dict[str, str] = {}
+
+    for row in rows:
+        sku = row["sku"]
+        item_id = str(row["item_id"] or "").strip()
+        variation_id = str(row["variation_id"] or "").strip()
+        inventory_id = str(row["inventory_id"] or "").strip()
+
+        if item_id and variation_id:
+            by_item_variation.setdefault((item_id, variation_id), sku)
+
+        if inventory_id:
+            by_inventory.setdefault(inventory_id, sku)
+
+        if item_id and not variation_id:
+            by_item.setdefault(item_id, sku)
+
+    return by_item_variation, by_inventory, by_item
 
 
 async def list_all_seller_item_ids(
@@ -759,6 +834,12 @@ async def sync_full_inventory_run(run_id: str) -> None:
             run.items_found = len(item_ids)
             session.commit()
 
+            (
+                sku_by_item_variation,
+                sku_by_inventory,
+                sku_by_item,
+            ) = build_order_sku_maps(session)
+
             inventory_records: list[dict[str, Any]] = []
 
             for index in range(0, len(item_ids), 20):
@@ -767,13 +848,7 @@ async def sync_full_inventory_run(run_id: str) -> None:
                     "https://api.mercadolibre.com/items",
                     account,
                     session,
-                    params={
-                        "ids": ",".join(batch),
-                        "attributes": (
-                            "id,title,category_id,inventory_id,"
-                            "seller_custom_field,attributes,variations"
-                        ),
-                    },
+                    params={"ids": ",".join(batch)},
                 )
 
                 responses = payload if isinstance(payload, list) else []
@@ -785,11 +860,19 @@ async def sync_full_inventory_run(run_id: str) -> None:
 
                     main_inventory_id = body.get("inventory_id")
                     if main_inventory_id:
+                        main_inventory_id = str(main_inventory_id)
+                        item_id_text = str(item_id) if item_id else ""
+                        resolved_sku = (
+                            extract_sku(body)
+                            or sku_by_inventory.get(main_inventory_id)
+                            or sku_by_item.get(item_id_text)
+                        )
+
                         inventory_records.append({
-                            "inventory_id": str(main_inventory_id),
-                            "item_id": str(item_id) if item_id else None,
+                            "inventory_id": main_inventory_id,
+                            "item_id": item_id_text or None,
                             "variation_id": None,
-                            "sku": extract_sku(body),
+                            "sku": resolved_sku,
                             "title": title,
                             "category_id": category_id,
                         })
@@ -798,15 +881,29 @@ async def sync_full_inventory_run(run_id: str) -> None:
                         inventory_id = variation.get("inventory_id")
                         if not inventory_id:
                             continue
+
+                        inventory_id_text = str(inventory_id)
+                        item_id_text = str(item_id) if item_id else ""
+                        variation_id_text = (
+                            str(variation.get("id"))
+                            if variation.get("id") is not None
+                            else ""
+                        )
+
+                        resolved_sku = (
+                            extract_sku(variation)
+                            or sku_by_inventory.get(inventory_id_text)
+                            or sku_by_item_variation.get(
+                                (item_id_text, variation_id_text)
+                            )
+                            or extract_sku(body)
+                        )
+
                         inventory_records.append({
-                            "inventory_id": str(inventory_id),
-                            "item_id": str(item_id) if item_id else None,
-                            "variation_id": (
-                                str(variation.get("id"))
-                                if variation.get("id") is not None
-                                else None
-                            ),
-                            "sku": extract_sku(variation) or extract_sku(body),
+                            "inventory_id": inventory_id_text,
+                            "item_id": item_id_text or None,
+                            "variation_id": variation_id_text or None,
+                            "sku": resolved_sku,
                             "title": title,
                             "category_id": category_id,
                         })
@@ -874,7 +971,7 @@ async def sync_full_inventory_run(run_id: str) -> None:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "0.8.0", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "0.8.2", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -885,7 +982,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "0.8.0",
+        "version": "0.8.2",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
@@ -1622,6 +1719,124 @@ def product_model_detail(
     )
 
 
+def full_replenishment_rows(
+    session,
+    search_value: str = "",
+) -> list[dict[str, Any]]:
+    rows = session.execute(
+        text(
+            """
+            WITH sales AS (
+                SELECT
+                    UPPER(BTRIM(oi.seller_sku)) AS sku,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN o.date_created >= :since_7
+                            THEN oi.quantity ELSE 0
+                        END
+                    ), 0) AS sales_7,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN o.date_created >= :since_14
+                            THEN oi.quantity ELSE 0
+                        END
+                    ), 0) AS sales_14,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN o.date_created >= :since_30
+                            THEN oi.quantity ELSE 0
+                        END
+                    ), 0) AS sales_30
+                FROM order_items oi
+                JOIN orders o ON o.id = oi.order_id
+                WHERE o.marketplace = 'MERCADO_LIBRE'
+                  AND o.date_created >= :since_30
+                  AND COALESCE(o.status, '') NOT IN (
+                      'cancelled',
+                      'invalid'
+                  )
+                  AND oi.seller_sku IS NOT NULL
+                GROUP BY UPPER(BTRIM(oi.seller_sku))
+            )
+            SELECT
+                fi.inventory_id,
+                fi.item_id,
+                fi.variation_id,
+                fi.sku,
+                fi.title,
+                fi.available_quantity,
+                fi.not_available_quantity,
+                COALESCE(s.sales_7, 0) AS sales_7,
+                COALESCE(s.sales_14, 0) AS sales_14,
+                COALESCE(s.sales_30, 0) AS sales_30
+            FROM full_inventory fi
+            LEFT JOIN sales s
+              ON s.sku = UPPER(BTRIM(fi.sku))
+            WHERE (
+                :search_value = ''
+                OR UPPER(COALESCE(fi.sku, '')) LIKE :search_like
+                OR UPPER(COALESCE(fi.title, '')) LIKE :search_like
+                OR UPPER(fi.inventory_id) LIKE :search_like
+            )
+            ORDER BY COALESCE(s.sales_30, 0) DESC, fi.sku
+            """
+        ),
+        {
+            "since_7": utcnow() - timedelta(days=7),
+            "since_14": utcnow() - timedelta(days=14),
+            "since_30": utcnow() - timedelta(days=30),
+            "search_value": search_value,
+            "search_like": f"%{search_value}%",
+        },
+    ).mappings().all()
+
+    result: list[dict[str, Any]] = []
+
+    for row in rows:
+        sales_7 = int(row["sales_7"] or 0)
+        sales_14 = int(row["sales_14"] or 0)
+        sales_30 = int(row["sales_30"] or 0)
+        available = int(row["available_quantity"] or 0)
+
+        projected_7 = sales_7 * 30 / 7
+        projected_14 = sales_14 * 30 / 14
+
+        # Suaviza una aceleración reciente:
+        # ejemplo: 31 ventas en 30 días y 21 en 7 días
+        # proyectado semanal = 90; promedio con histórico = 60.5.
+        adjusted_7 = (sales_30 + projected_7) / 2
+        adjusted_14 = (sales_30 + projected_14) / 2
+
+        target_30_days = math.ceil(max(
+            float(sales_30),
+            adjusted_7,
+            adjusted_14,
+        ))
+
+        suggested_shipment = max(0, target_30_days - available)
+
+        result.append({
+            "inventory_id": row["inventory_id"],
+            "item_id": row["item_id"],
+            "variation_id": row["variation_id"],
+            "sku": row["sku"],
+            "title": row["title"],
+            "available_quantity": available,
+            "not_available_quantity": int(
+                row["not_available_quantity"] or 0
+            ),
+            "sales_7": sales_7,
+            "sales_14": sales_14,
+            "sales_30": sales_30,
+            "projected_7": round(projected_7, 2),
+            "projected_14": round(projected_14, 2),
+            "target_30_days": target_30_days,
+            "suggested_shipment": suggested_shipment,
+        })
+
+    return result
+
+
 @app.post("/sync/mercadolibre/full")
 async def start_full_sync() -> JSONResponse:
     if SessionLocal is None:
@@ -1838,6 +2053,221 @@ def full_inventory_report(
     })
 
 
+@app.get("/api/full/replenishment")
+def full_replenishment(
+    search: str | None = Query(default=None),
+) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    search_value = (search or "").strip().upper()
+
+    with SessionLocal() as session:
+        rows = full_replenishment_rows(session, search_value)
+
+    return JSONResponse(content={
+        "status": "ok",
+        "method": (
+            "Mayor entre ventas 30 días y promedio suavizado "
+            "con ritmos de 7 y 14 días."
+        ),
+        "items": rows,
+    })
+
+
+@app.get("/api/full/shipment.xlsx")
+def download_full_shipment(
+    search: str | None = Query(default=None),
+) -> StreamingResponse:
+    if SessionLocal is None:
+        return StreamingResponse(
+            io.BytesIO(b""),
+            status_code=500,
+            media_type="application/octet-stream",
+        )
+
+    search_value = (search or "").strip().upper()
+
+    with SessionLocal() as session:
+        rows = full_replenishment_rows(session, search_value)
+
+    rows_to_send = [
+        row for row in rows
+        if row["suggested_shipment"] > 0
+    ]
+
+    output = io.BytesIO()
+
+    import xlsxwriter
+
+    workbook = xlsxwriter.Workbook(output, {"in_memory": True})
+    worksheet = workbook.add_worksheet("Envio FULL sugerido")
+
+    title_format = workbook.add_format({
+        "bold": True,
+        "font_size": 16,
+        "font_color": "#FFFFFF",
+        "bg_color": "#111827",
+        "align": "left",
+        "valign": "vcenter",
+    })
+    subtitle_format = workbook.add_format({
+        "font_color": "#475467",
+        "italic": True,
+    })
+    header_format = workbook.add_format({
+        "bold": True,
+        "font_color": "#FFFFFF",
+        "bg_color": "#344054",
+        "border": 1,
+        "align": "center",
+        "valign": "vcenter",
+    })
+    text_format = workbook.add_format({
+        "border": 1,
+        "valign": "top",
+    })
+    integer_format = workbook.add_format({
+        "border": 1,
+        "num_format": "0",
+        "align": "right",
+    })
+    decimal_format = workbook.add_format({
+        "border": 1,
+        "num_format": "0.00",
+        "align": "right",
+    })
+    send_format = workbook.add_format({
+        "bold": True,
+        "border": 1,
+        "num_format": "0",
+        "align": "right",
+        "bg_color": "#ECFDF3",
+        "font_color": "#067647",
+    })
+
+    worksheet.merge_range(
+        "A1:N1",
+        "GETAC — Envío sugerido a Mercado Libre FULL",
+        title_format,
+    )
+    worksheet.write(
+        "A2",
+        (
+            "Objetivo: cubrir 30 días usando la mayor demanda entre "
+            "ventas de 30 días y tendencias suavizadas de 7 y 14 días."
+        ),
+        subtitle_format,
+    )
+    worksheet.write(
+        "A3",
+        f"Generado: {utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+        subtitle_format,
+    )
+
+    headers = [
+        "SKU",
+        "Producto",
+        "Inventory ID",
+        "Item ID",
+        "Variation ID",
+        "Stock disponible FULL",
+        "No disponible",
+        "Ventas 7 días",
+        "Ventas 14 días",
+        "Ventas 30 días",
+        "Proyección ritmo 7 días",
+        "Proyección ritmo 14 días",
+        "Objetivo stock 30 días",
+        "Cantidad sugerida a enviar",
+    ]
+
+    start_row = 4
+    for col, header in enumerate(headers):
+        worksheet.write(start_row, col, header, header_format)
+
+    for row_index, row in enumerate(rows_to_send, start=start_row + 1):
+        worksheet.write(row_index, 0, row["sku"] or "", text_format)
+        worksheet.write(row_index, 1, row["title"] or "", text_format)
+        worksheet.write(row_index, 2, row["inventory_id"], text_format)
+        worksheet.write(row_index, 3, row["item_id"] or "", text_format)
+        worksheet.write(
+            row_index, 4, row["variation_id"] or "", text_format
+        )
+        worksheet.write_number(
+            row_index, 5, row["available_quantity"], integer_format
+        )
+        worksheet.write_number(
+            row_index, 6, row["not_available_quantity"], integer_format
+        )
+        worksheet.write_number(
+            row_index, 7, row["sales_7"], integer_format
+        )
+        worksheet.write_number(
+            row_index, 8, row["sales_14"], integer_format
+        )
+        worksheet.write_number(
+            row_index, 9, row["sales_30"], integer_format
+        )
+        worksheet.write_number(
+            row_index, 10, row["projected_7"], decimal_format
+        )
+        worksheet.write_number(
+            row_index, 11, row["projected_14"], decimal_format
+        )
+        worksheet.write_number(
+            row_index, 12, row["target_30_days"], integer_format
+        )
+        worksheet.write_number(
+            row_index, 13, row["suggested_shipment"], send_format
+        )
+
+    worksheet.freeze_panes(start_row + 1, 0)
+    worksheet.autofilter(
+        start_row,
+        0,
+        start_row + max(len(rows_to_send), 1),
+        len(headers) - 1,
+    )
+    worksheet.set_column("A:A", 22)
+    worksheet.set_column("B:B", 48)
+    worksheet.set_column("C:E", 20)
+    worksheet.set_column("F:J", 17)
+    worksheet.set_column("K:N", 22)
+    worksheet.set_row(0, 28)
+
+    total_row = start_row + len(rows_to_send) + 2
+    worksheet.write(total_row, 12, "TOTAL A ENVIAR", header_format)
+    worksheet.write_formula(
+        total_row,
+        13,
+        f"=SUM(N{start_row + 2}:N{start_row + len(rows_to_send) + 1})",
+        send_format,
+    )
+
+    workbook.close()
+    output.seek(0)
+
+    filename = (
+        "GETAC_envio_FULL_"
+        f"{utcnow().strftime('%Y-%m-%d')}.xlsx"
+    )
+
+    return StreamingResponse(
+        output,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )
+
+
 @app.get("/full", response_class=HTMLResponse)
 def full_page() -> HTMLResponse:
     return HTMLResponse(content=r"""
@@ -1905,7 +2335,7 @@ border-radius:10px;margin-bottom:14px}
 <main class="main">
 <div class="top">
 <div><h1>Inventario FULL</h1>
-<div class="sub">Stock actual comparado con ventas recientes</div></div>
+<div class="sub">Stock FULL relacionado con SKU y ventas recientes</div></div>
 <div class="controls">
 <select id="days"><option value="30" selected>Ventas 30 días</option>
 <option value="7">Ventas 7 días</option>
@@ -1914,6 +2344,7 @@ border-radius:10px;margin-bottom:14px}
 <input id="search" type="search" placeholder="Buscar SKU, producto o inventory ID">
 <button onclick="loadInventory()">Buscar</button>
 <button onclick="startSync()">Actualizar stock FULL</button>
+<button onclick="downloadShipment()">Descargar envío sugerido</button>
 </div>
 </div>
 <div id="error" class="error"></div>
@@ -1929,7 +2360,7 @@ border-radius:10px;margin-bottom:14px}
 <div id="stockTotal" class="value">0</div></div>
 <div class="card"><div class="label">Ventas del periodo</div>
 <div id="salesTotal" class="value">0</div></div>
-<div class="card"><div class="label">Riesgo ≤ 15 días</div>
+<div class="card"><div class="label">SKUs para enviar</div>
 <div id="riskCount" class="value">0</div></div>
 </section>
 <div class="panel">
@@ -1938,7 +2369,8 @@ border-radius:10px;margin-bottom:14px}
 <thead><tr>
 <th>SKU</th><th>Producto</th><th>Inventory ID</th>
 <th class="num">Stock FULL</th><th class="num">No disponible</th>
-<th class="num">Ventas</th><th class="num">Promedio/día</th>
+<th class="num">Ventas 7d</th><th class="num">Ventas 30d</th>
+<th class="num">Objetivo 30d</th><th class="num">Enviar</th>
 <th class="num">Días de stock</th>
 </tr></thead>
 <tbody id="body"></tbody>
@@ -1958,30 +2390,42 @@ document.getElementById('error').style.display='none';
 const days=document.getElementById('days').value;
 const search=document.getElementById('search').value.trim();
 try{
-const p=new URLSearchParams({days,limit:'10000'});
+const p=new URLSearchParams();
 if(search)p.set('search',search);
-const r=await fetch('/api/full/inventory?'+p.toString(),{cache:'no-store'});
+const r=await fetch('/api/full/replenishment?'+p.toString(),{cache:'no-store'});
 if(!r.ok)throw new Error('Error '+r.status);
 const d=await r.json(),items=d.items||[];
 document.getElementById('skuCount').textContent=integer.format(items.length);
 document.getElementById('stockTotal').textContent=integer.format(
 items.reduce((a,x)=>a+x.available_quantity,0));
 document.getElementById('salesTotal').textContent=integer.format(
-items.reduce((a,x)=>a+x.units_sold,0));
+items.reduce((a,x)=>a+x.sales_30,0));
 document.getElementById('riskCount').textContent=integer.format(
-items.filter(x=>x.days_of_stock!==null&&x.days_of_stock<=15).length);
+items.filter(x=>x.suggested_shipment>0).length);
 document.getElementById('body').innerHTML=items.map(x=>{
-let cls='';if(x.days_of_stock!==null){
-cls=x.days_of_stock<=15?'risk-high':x.days_of_stock<=30?'risk-mid':'risk-ok'}
+let cls='';const daysStock=x.sales_30>0?
+x.available_quantity/(x.sales_30/30):null;
+if(daysStock!==null){
+cls=daysStock<=15?'risk-high':daysStock<=30?'risk-mid':'risk-ok'}
 return `<tr><td><strong>${esc(x.sku||'SIN SKU')}</strong></td>
 <td>${esc(x.title||'')}</td><td>${esc(x.inventory_id)}</td>
 <td class="num">${integer.format(x.available_quantity)}</td>
 <td class="num">${integer.format(x.not_available_quantity)}</td>
-<td class="num">${integer.format(x.units_sold)}</td>
-<td class="num">${x.daily_average.toFixed(2)}</td>
-<td class="num ${cls}">${x.days_of_stock===null?'Sin ventas':
-x.days_of_stock.toFixed(1)}</td></tr>`}).join('');
+<td class="num">${integer.format(x.sales_7)}</td>
+<td class="num">${integer.format(x.sales_30)}</td>
+<td class="num">${integer.format(x.target_30_days)}</td>
+<td class="num"><strong>${integer.format(x.suggested_shipment)}</strong></td>
+<td class="num ${cls}">${
+x.sales_30===0?'Sin ventas':
+(x.available_quantity/(x.sales_30/30)).toFixed(1)
+}</td></tr>`}).join('');
 }catch(e){showError('No se pudo cargar FULL: '+e.message)}
+}
+function downloadShipment(){
+const search=document.getElementById('search').value.trim();
+const p=new URLSearchParams();
+if(search)p.set('search',search);
+window.location.href='/api/full/shipment.xlsx?'+p.toString();
 }
 async function startSync(){
 try{
