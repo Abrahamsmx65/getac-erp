@@ -207,6 +207,56 @@ class Payment(Base):
     order: Mapped[Order] = relationship(back_populates="payments")
 
 
+class ProductCatalog(Base):
+    __tablename__ = "product_catalog"
+    __table_args__ = (
+        UniqueConstraint(
+            "marketplace",
+            "item_id",
+            "variation_id",
+            name="uq_product_catalog_marketplace_item_variation",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+    marketplace: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="MERCADO_LIBRE",
+    )
+    item_id: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    variation_id: Mapped[str] = mapped_column(
+        String(80),
+        nullable=False,
+        default="",
+        index=True,
+    )
+    inventory_id: Mapped[str | None] = mapped_column(
+        String(80),
+        index=True,
+    )
+    seller_sku: Mapped[str | None] = mapped_column(
+        String(180),
+        index=True,
+    )
+    model: Mapped[str | None] = mapped_column(String(120), index=True)
+    color: Mapped[str | None] = mapped_column(String(120), index=True)
+    size: Mapped[str | None] = mapped_column(String(120), index=True)
+    title: Mapped[str | None] = mapped_column(String(500))
+    category_id: Mapped[str | None] = mapped_column(String(80))
+    status: Mapped[str | None] = mapped_column(String(60))
+    raw_data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    last_synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utcnow,
+    )
+
+
 class FullInventory(Base):
     __tablename__ = "full_inventory"
 
@@ -326,7 +376,7 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="0.9.1",
+    version="1.0.0",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
@@ -1081,11 +1131,30 @@ async def sync_full_inventory_run(run_id: str) -> None:
             run.items_found = len(item_ids)
             session.commit()
 
+            await sync_product_catalog()
+
             (
                 sku_by_item_variation,
                 sku_by_inventory,
                 sku_by_item,
             ) = build_order_sku_maps(session)
+
+            catalog_rows = session.scalars(
+                select(ProductCatalog).where(
+                    ProductCatalog.marketplace
+                    == "MERCADO_LIBRE"
+                )
+            ).all()
+
+            catalog_by_inventory = {
+                row.inventory_id: row
+                for row in catalog_rows
+                if row.inventory_id
+            }
+            catalog_by_item_variation = {
+                (row.item_id, row.variation_id): row
+                for row in catalog_rows
+            }
 
             inventory_records: list[dict[str, Any]] = []
 
@@ -1109,8 +1178,18 @@ async def sync_full_inventory_run(run_id: str) -> None:
                     if main_inventory_id:
                         main_inventory_id = str(main_inventory_id)
                         item_id_text = str(item_id) if item_id else ""
+                        catalog_record = (
+                            catalog_by_inventory.get(main_inventory_id)
+                            or catalog_by_item_variation.get(
+                                (item_id_text, "")
+                            )
+                        )
                         resolved_sku = (
                             extract_sku(body)
+                            or (
+                                catalog_record.seller_sku
+                                if catalog_record else None
+                            )
                             or sku_by_inventory.get(main_inventory_id)
                             or sku_by_item.get(item_id_text)
                         )
@@ -1137,8 +1216,18 @@ async def sync_full_inventory_run(run_id: str) -> None:
                             else ""
                         )
 
+                        catalog_record = (
+                            catalog_by_inventory.get(inventory_id_text)
+                            or catalog_by_item_variation.get(
+                                (item_id_text, variation_id_text)
+                            )
+                        )
                         resolved_sku = (
                             extract_sku(variation)
+                            or (
+                                catalog_record.seller_sku
+                                if catalog_record else None
+                            )
                             or sku_by_inventory.get(inventory_id_text)
                             or sku_by_item_variation.get(
                                 (item_id_text, variation_id_text)
@@ -1244,9 +1333,233 @@ async def sync_full_inventory_run(run_id: str) -> None:
         full_sync_tasks.pop(run_id, None)
 
 
+def parse_sku_parts(sku: str | None) -> tuple[str | None, str | None, str | None]:
+    if not sku:
+        return None, None, None
+
+    value = sku.strip().upper()
+    if not value:
+        return None, None, None
+
+    parts = value.split("-")
+    model = parts[0] if parts else None
+    color = parts[1] if len(parts) >= 2 else None
+    size = parts[-1] if len(parts) >= 3 else None
+    return model, color, size
+
+
+def catalog_sku_from_history(
+    session,
+    item_id: str,
+    variation_id: str,
+    inventory_id: str | None,
+) -> str | None:
+    query = select(OrderItem.seller_sku).where(
+        OrderItem.external_item_id == item_id,
+        OrderItem.seller_sku.is_not(None),
+        OrderItem.seller_sku != "",
+    )
+
+    if variation_id:
+        query = query.where(
+            OrderItem.variation_id == int(variation_id)
+        )
+
+    sku = session.scalar(
+        query.order_by(OrderItem.id.desc()).limit(1)
+    )
+    if sku:
+        return str(sku).strip().upper()
+
+    if inventory_id:
+        row = session.scalar(
+            select(FullInventory).where(
+                FullInventory.inventory_id == inventory_id
+            )
+        )
+        if row and row.sku:
+            return row.sku.strip().upper()
+
+    return None
+
+
+def upsert_catalog_record(
+    session,
+    *,
+    item_id: str,
+    variation_id: str,
+    inventory_id: str | None,
+    seller_sku: str | None,
+    title: str | None,
+    category_id: str | None,
+    status: str | None,
+    raw_data: dict[str, Any] | None,
+) -> ProductCatalog:
+    existing = session.scalar(
+        select(ProductCatalog).where(
+            ProductCatalog.marketplace == "MERCADO_LIBRE",
+            ProductCatalog.item_id == item_id,
+            ProductCatalog.variation_id == variation_id,
+        )
+    )
+
+    resolved_sku = seller_sku
+    if not resolved_sku:
+        resolved_sku = catalog_sku_from_history(
+            session,
+            item_id,
+            variation_id,
+            inventory_id,
+        )
+
+    if not existing:
+        existing = ProductCatalog(
+            marketplace="MERCADO_LIBRE",
+            item_id=item_id,
+            variation_id=variation_id,
+        )
+        session.add(existing)
+
+    model, color, size = parse_sku_parts(resolved_sku)
+
+    existing.inventory_id = inventory_id
+    existing.seller_sku = resolved_sku
+    existing.model = model
+    existing.color = color
+    existing.size = size
+    existing.title = title
+    existing.category_id = category_id
+    existing.status = status
+    existing.raw_data = raw_data
+    existing.last_synced_at = utcnow()
+
+    session.flush()
+    return existing
+
+
+async def sync_product_catalog() -> dict[str, Any]:
+    if SessionLocal is None:
+        raise RuntimeError("database_not_configured")
+
+    with SessionLocal() as session:
+        account = get_account(session)
+        if account is None:
+            raise RuntimeError("mercadolibre_not_connected")
+
+        item_ids = await list_all_seller_item_ids(account, session)
+        processed = 0
+        with_sku = 0
+        without_sku = 0
+
+        for index in range(0, len(item_ids), 20):
+            batch = item_ids[index:index + 20]
+            payload = await meli_get(
+                "https://api.mercadolibre.com/items",
+                account,
+                session,
+                params={"ids": ",".join(batch)},
+            )
+
+            responses = payload if isinstance(payload, list) else []
+
+            for response_item in responses:
+                body = response_item.get("body") or {}
+                item_id = str(body.get("id") or "").strip()
+                if not item_id:
+                    continue
+
+                title = body.get("title")
+                category_id = body.get("category_id")
+                status = body.get("status")
+
+                variations = body.get("variations") or []
+
+                if variations:
+                    for variation in variations:
+                        variation_id = str(
+                            variation.get("id") or ""
+                        ).strip()
+                        inventory_id = (
+                            str(variation.get("inventory_id"))
+                            if variation.get("inventory_id")
+                            else None
+                        )
+                        sku = (
+                            extract_sku(variation)
+                            or catalog_sku_from_history(
+                                session,
+                                item_id,
+                                variation_id,
+                                inventory_id,
+                            )
+                        )
+
+                        record = upsert_catalog_record(
+                            session,
+                            item_id=item_id,
+                            variation_id=variation_id,
+                            inventory_id=inventory_id,
+                            seller_sku=sku,
+                            title=title,
+                            category_id=category_id,
+                            status=status,
+                            raw_data=variation,
+                        )
+
+                        processed += 1
+                        if record.seller_sku:
+                            with_sku += 1
+                        else:
+                            without_sku += 1
+                else:
+                    inventory_id = (
+                        str(body.get("inventory_id"))
+                        if body.get("inventory_id")
+                        else None
+                    )
+                    sku = (
+                        extract_sku(body)
+                        or catalog_sku_from_history(
+                            session,
+                            item_id,
+                            "",
+                            inventory_id,
+                        )
+                    )
+
+                    record = upsert_catalog_record(
+                        session,
+                        item_id=item_id,
+                        variation_id="",
+                        inventory_id=inventory_id,
+                        seller_sku=sku,
+                        title=title,
+                        category_id=category_id,
+                        status=status,
+                        raw_data=body,
+                    )
+
+                    processed += 1
+                    if record.seller_sku:
+                        with_sku += 1
+                    else:
+                        without_sku += 1
+
+            session.commit()
+            await asyncio.sleep(0.5)
+
+        return {
+            "status": "success",
+            "items_found": len(item_ids),
+            "catalog_records": processed,
+            "with_sku": with_sku,
+            "without_sku": without_sku,
+        }
+
+
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "0.9.1", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "1.0.0", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -1257,7 +1570,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "0.9.1",
+        "version": "1.0.0",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
@@ -1287,6 +1600,7 @@ def database_health() -> JSONResponse:
                     "webhook_events",
                     "sync_logs",
                     "sync_jobs",
+                    "product_catalog",
                     "full_inventory",
                     "full_sync_runs",
                 ],
@@ -2266,6 +2580,26 @@ def full_replenishment_rows(
 
         suggested_shipment = max(0, target_30_days - available)
 
+        coverage_days = None
+        if target_30_days > 0:
+            daily_target = target_30_days / 30
+            if daily_target > 0:
+                coverage_days = round(
+                    available / daily_target,
+                    1,
+                )
+
+        if suggested_shipment <= 0:
+            priority = "OK"
+        elif available <= 0:
+            priority = "CRITICO"
+        elif coverage_days is not None and coverage_days <= 7:
+            priority = "CRITICO"
+        elif coverage_days is not None and coverage_days <= 15:
+            priority = "ALTO"
+        else:
+            priority = "MEDIO"
+
         result.append({
             "inventory_id": row["inventory_id"],
             "item_id": row["item_id"],
@@ -2283,9 +2617,67 @@ def full_replenishment_rows(
             "projected_14": round(projected_14, 2),
             "target_30_days": target_30_days,
             "suggested_shipment": suggested_shipment,
+            "coverage_days": coverage_days,
+            "priority": priority,
         })
 
     return result
+
+
+@app.post("/sync/mercadolibre/catalog")
+async def sync_catalog_endpoint() -> JSONResponse:
+    try:
+        result = await sync_product_catalog()
+        return JSONResponse(content=result)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "detail": str(exc)},
+        )
+
+
+@app.get("/api/catalog/diagnostics")
+def catalog_diagnostics() -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    with SessionLocal() as session:
+        row = session.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (
+                        WHERE seller_sku IS NOT NULL
+                          AND BTRIM(seller_sku) <> ''
+                    ) AS with_sku,
+                    COUNT(*) FILTER (
+                        WHERE seller_sku IS NULL
+                           OR BTRIM(seller_sku) = ''
+                    ) AS without_sku,
+                    COUNT(DISTINCT model) FILTER (
+                        WHERE model IS NOT NULL
+                          AND BTRIM(model) <> ''
+                    ) AS distinct_models,
+                    COUNT(DISTINCT inventory_id) FILTER (
+                        WHERE inventory_id IS NOT NULL
+                          AND BTRIM(inventory_id) <> ''
+                    ) AS with_inventory_id
+                FROM product_catalog
+                """
+            )
+        ).mappings().one()
+
+    return JSONResponse(content={
+        "total": int(row["total"] or 0),
+        "with_sku": int(row["with_sku"] or 0),
+        "without_sku": int(row["without_sku"] or 0),
+        "distinct_models": int(row["distinct_models"] or 0),
+        "with_inventory_id": int(row["with_inventory_id"] or 0),
+    })
 
 
 @app.post("/sync/mercadolibre/full")
@@ -2671,7 +3063,7 @@ def download_full_shipment(
     })
 
     worksheet.merge_range(
-        "A1:N1",
+        "A1:P1",
         "GETAC — Envío sugerido a Mercado Libre FULL",
         title_format,
     )
@@ -2703,7 +3095,9 @@ def download_full_shipment(
         "Proyección ritmo 7 días",
         "Proyección ritmo 14 días",
         "Objetivo stock 30 días",
+        "Cobertura estimada días",
         "Cantidad sugerida a enviar",
+        "Prioridad",
     ]
 
     start_row = 4
@@ -2743,7 +3137,19 @@ def download_full_shipment(
             row_index, 12, row["target_30_days"], integer_format
         )
         worksheet.write_number(
-            row_index, 13, row["suggested_shipment"], send_format
+            row_index, 13,
+            row["coverage_days"] or 0,
+            decimal_format,
+        )
+        worksheet.write_number(
+            row_index, 14,
+            row["suggested_shipment"],
+            send_format,
+        )
+        worksheet.write(
+            row_index, 15,
+            row["priority"],
+            text_format,
         )
 
     worksheet.freeze_panes(start_row + 1, 0)
@@ -2757,15 +3163,15 @@ def download_full_shipment(
     worksheet.set_column("B:B", 48)
     worksheet.set_column("C:E", 20)
     worksheet.set_column("F:J", 17)
-    worksheet.set_column("K:N", 22)
+    worksheet.set_column("K:P", 22)
     worksheet.set_row(0, 28)
 
     total_row = start_row + len(rows_to_send) + 2
-    worksheet.write(total_row, 12, "TOTAL A ENVIAR", header_format)
+    worksheet.write(total_row, 13, "TOTAL A ENVIAR", header_format)
     worksheet.write_formula(
         total_row,
-        13,
-        f"=SUM(N{start_row + 2}:N{start_row + len(rows_to_send) + 1})",
+        14,
+        f"=SUM(O{start_row + 2}:O{start_row + len(rows_to_send) + 1})",
         send_format,
     )
 
@@ -2865,6 +3271,7 @@ border-radius:10px;margin-bottom:14px}
 <option value="90">Ventas 90 días</option></select>
 <input id="search" type="search" placeholder="Buscar SKU, producto o inventory ID">
 <button onclick="loadInventory()">Buscar</button>
+<button onclick="syncCatalog()">Actualizar catálogo</button>
 <button onclick="startSync()">Actualizar / reiniciar stock FULL</button>
 <button onclick="downloadShipment()">Descargar envío sugerido</button>
 </div>
@@ -2948,6 +3355,18 @@ const search=document.getElementById('search').value.trim();
 const p=new URLSearchParams();
 if(search)p.set('search',search);
 window.location.href='/api/full/shipment.xlsx?'+p.toString();
+}
+async function syncCatalog(){
+const msg=document.getElementById('syncText');
+msg.textContent='Actualizando catálogo maestro…';
+try{
+const r=await fetch('/sync/mercadolibre/catalog',{method:'POST'});
+const d=await r.json();
+if(!r.ok)throw new Error(d.detail||'Error '+r.status);
+msg.textContent=
+`Catálogo listo · ${d.catalog_records||0} registros · `+
+`${d.with_sku||0} con SKU · ${d.without_sku||0} sin SKU`;
+}catch(e){showError('No se pudo actualizar catálogo: '+e.message)}
 }
 async function startSync(){
 try{

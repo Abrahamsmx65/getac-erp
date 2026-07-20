@@ -1,42 +1,79 @@
-# GETAC ERP v0.9.1 — Corrección de actualización FULL y SKU
+# GETAC ERP v1.0 — Envíos Mercado Libre FULL
 
-## Problema corregido 1: actualización detenida
+Esta versión se enfoca únicamente en dejar estable el flujo de envíos a FULL.
 
-Cuando Railway despliega una versión nueva, las tareas en memoria terminan.
-La base de datos podía quedarse mostrando `RUNNING` para siempre.
+## Catálogo maestro
 
-Ahora:
+Nueva tabla:
 
-- Las ejecuciones interrumpidas se marcan `INTERRUPTED`.
-- El botón `Actualizar / reiniciar stock FULL` crea una ejecución nueva.
-- El endpoint de estado valida que exista una tarea real.
-- Al arrancar el servidor se limpian ejecuciones antiguas atascadas.
+- `product_catalog`
 
-## Problema corregido 2: solo aparecían SKU de GT110
+Guarda por variante:
 
-La relación estaba intentando leer item_id y variation_id desde el JSON.
-Ahora usa directamente:
+- Item ID
+- Variation ID
+- Inventory ID
+- SKU
+- Modelo
+- Color
+- Talla
+- Título
+- Categoría
+- Estado
 
-- `order_items.external_item_id`
-- `order_items.variation_id`
-- `order_items.seller_sku`
+## Flujo recomendado
 
-También evita usar un SKU genérico del item cuando el mismo item tiene
-varias variantes, para no asignar el SKU de una talla a todas las demás.
+1. Abrir `/full`
+2. Presionar `Actualizar catálogo`
+3. Presionar `Actualizar / reiniciar stock FULL`
+4. Revisar ventas y cobertura
+5. Descargar el Excel de envío sugerido
 
-## Después de instalar
+## Reabasto
 
-1. Espera a que Railway quede Online.
-2. Abre `/full`.
-3. Presiona `Actualizar / reiniciar stock FULL`.
-4. La ejecución anterior en 600 se marcará como interrumpida.
-5. Se iniciará una actualización nueva con el cruce de SKU corregido.
+Para cada SKU calcula:
+
+- Ventas 7 días
+- Ventas 14 días
+- Ventas 30 días
+- Proyección mensual por ritmo reciente
+- Objetivo de stock para 30 días
+- Stock FULL disponible
+- Cobertura estimada
+- Cantidad sugerida a enviar
+- Prioridad:
+  - CRITICO
+  - ALTO
+  - MEDIO
+  - OK
+
+## Excel
+
+El archivo incluye:
+
+- SKU
+- Producto
+- Inventory ID
+- Item ID
+- Variation ID
+- Stock FULL
+- Ventas 7, 14 y 30 días
+- Proyecciones
+- Objetivo 30 días
+- Cobertura
+- Cantidad sugerida
+- Prioridad
+
+## Automatización
+
+Mantiene:
+
+- sincronización diaria a la 1:00 AM
+- manejo de errores 429
+- detección de procesos interrumpidos
+- reinicio seguro de la actualización FULL
 
 ## Diagnóstico
 
-La ruta `/api/full/sku-diagnostics` muestra:
-
-- inventarios totales
-- inventarios con SKU
-- inventarios sin SKU
-- modelos distintos encontrados
+- `/api/catalog/diagnostics`
+- `/api/full/sku-diagnostics`
