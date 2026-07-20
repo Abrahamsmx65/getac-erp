@@ -6,6 +6,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 
 import httpx
@@ -242,6 +243,20 @@ class FullSyncRun(Base):
     )
 
 
+class CategoryCache(Base):
+    __tablename__ = "category_cache"
+
+    category_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    path_from_root: Mapped[list[Any] | None] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+
 class SyncJob(Base):
     __tablename__ = "sync_jobs"
 
@@ -311,16 +326,17 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="0.8.2",
+    version="0.9.0",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
 worker_task: asyncio.Task | None = None
+daily_scheduler_task: asyncio.Task | None = None
 
 
 @app.on_event("startup")
 async def startup() -> None:
-    global worker_task
+    global worker_task, daily_scheduler_task
 
     if engine is not None:
         Base.metadata.create_all(bind=engine)
@@ -328,6 +344,9 @@ async def startup() -> None:
     if SERVICE_ROLE in ("all", "worker"):
         print({"service_role": SERVICE_ROLE, "worker": "started"})
         worker_task = asyncio.create_task(sync_worker_loop())
+        daily_scheduler_task = asyncio.create_task(
+            daily_sync_scheduler_loop()
+        )
     else:
         print({"service_role": SERVICE_ROLE, "worker": "disabled"})
 
@@ -674,6 +693,198 @@ async def process_historical_job(job_id: str) -> None:
                     error_session.commit()
 
 
+async def sync_orders_for_exact_range(
+    start_utc: datetime,
+    end_utc: datetime,
+    sync_type: str,
+) -> dict[str, Any]:
+    if SessionLocal is None:
+        raise RuntimeError("database_not_configured")
+
+    with SessionLocal() as session:
+        account = get_account(session)
+        if account is None:
+            raise RuntimeError("mercadolibre_not_connected")
+
+        existing = session.scalar(
+            select(SyncLog).where(
+                SyncLog.marketplace == "MERCADO_LIBRE",
+                SyncLog.sync_type == sync_type,
+                SyncLog.status == "SUCCESS",
+            )
+        )
+        if existing:
+            return {
+                "status": "already_completed",
+                "records_processed": existing.records_processed,
+            }
+
+        running = session.scalar(
+            select(SyncLog).where(
+                SyncLog.marketplace == "MERCADO_LIBRE",
+                SyncLog.sync_type == sync_type,
+                SyncLog.status == "RUNNING",
+            )
+        )
+        if running:
+            return {"status": "already_running"}
+
+        sync_log = SyncLog(
+            marketplace="MERCADO_LIBRE",
+            sync_type=sync_type,
+            status="RUNNING",
+            started_at=utcnow(),
+        )
+        session.add(sync_log)
+        session.commit()
+        log_id = sync_log.id
+
+        processed = 0
+        offset = 0
+        limit = 50
+
+        try:
+            while True:
+                params = {
+                    "seller": account.external_user_id,
+                    "order.date_created.from": (
+                        start_utc.strftime(
+                            "%Y-%m-%dT%H:%M:%S.000-00:00"
+                        )
+                    ),
+                    "order.date_created.to": (
+                        end_utc.strftime(
+                            "%Y-%m-%dT%H:%M:%S.000-00:00"
+                        )
+                    ),
+                    "sort": "date_asc",
+                    "offset": offset,
+                    "limit": limit,
+                }
+
+                payload = await meli_get(
+                    "https://api.mercadolibre.com/orders/search",
+                    account,
+                    session,
+                    params=params,
+                )
+                orders_data = payload.get("results") or []
+                total = int(
+                    (payload.get("paging") or {}).get("total") or 0
+                )
+
+                if not orders_data:
+                    break
+
+                for order_data in orders_data:
+                    upsert_order(session, account, order_data)
+                    processed += 1
+
+                session.commit()
+                offset += len(orders_data)
+
+                if offset >= total or len(orders_data) < limit:
+                    break
+
+                await asyncio.sleep(0.8)
+
+            sync_log = session.get(SyncLog, log_id)
+            if sync_log:
+                sync_log.status = "SUCCESS"
+                sync_log.finished_at = utcnow()
+                sync_log.records_processed = processed
+                sync_log.error_message = None
+                session.commit()
+
+            return {
+                "status": "success",
+                "records_processed": processed,
+            }
+
+        except Exception as exc:
+            session.rollback()
+            sync_log = session.get(SyncLog, log_id)
+            if sync_log:
+                sync_log.status = "ERROR"
+                sync_log.finished_at = utcnow()
+                sync_log.records_processed = processed
+                sync_log.error_message = str(exc)[:4000]
+                session.commit()
+            raise
+
+
+async def run_previous_day_sync() -> dict[str, Any]:
+    mexico_tz = ZoneInfo("America/Mexico_City")
+    now_local = datetime.now(mexico_tz)
+    previous_date = now_local.date() - timedelta(days=1)
+
+    start_local = datetime.combine(
+        previous_date,
+        datetime.min.time(),
+        tzinfo=mexico_tz,
+    )
+    end_local = start_local + timedelta(days=1)
+
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+
+    return await sync_orders_for_exact_range(
+        start_utc=start_utc,
+        end_utc=end_utc,
+        sync_type=f"DAILY_ORDERS_{previous_date.isoformat()}",
+    )
+
+
+async def daily_sync_scheduler_loop() -> None:
+    mexico_tz = ZoneInfo("America/Mexico_City")
+
+    while True:
+        try:
+            now_local = datetime.now(mexico_tz)
+
+            if now_local.hour >= 1:
+                previous_date = (
+                    now_local.date() - timedelta(days=1)
+                )
+                sync_type = (
+                    f"DAILY_ORDERS_{previous_date.isoformat()}"
+                )
+
+                should_run = True
+                if SessionLocal is not None:
+                    with SessionLocal() as session:
+                        existing = session.scalar(
+                            select(SyncLog).where(
+                                SyncLog.marketplace
+                                == "MERCADO_LIBRE",
+                                SyncLog.sync_type == sync_type,
+                                SyncLog.status.in_(
+                                    ["SUCCESS", "RUNNING"]
+                                ),
+                            )
+                        )
+                        should_run = existing is None
+
+                if should_run:
+                    print({
+                        "event": "daily_sync_start",
+                        "date": previous_date.isoformat(),
+                        "timezone": "America/Mexico_City",
+                    })
+                    await run_previous_day_sync()
+
+            await asyncio.sleep(60)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print({
+                "event": "daily_sync_error",
+                "error": str(exc),
+            })
+            await asyncio.sleep(300)
+
+
 async def sync_worker_loop() -> None:
     while True:
         try:
@@ -971,7 +1182,7 @@ async def sync_full_inventory_run(run_id: str) -> None:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "0.8.2", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "0.9.0", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -982,7 +1193,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "0.8.2",
+        "version": "0.9.0",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
@@ -1126,6 +1337,173 @@ async def mercadolibre_callback(code: str | None = None) -> JSONResponse:
             "nickname": profile_data.get("nickname"),
         }
     )
+
+
+@app.get("/sync/jobs")
+def list_sync_jobs(
+    limit: int = Query(default=20, ge=1, le=100),
+) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    with SessionLocal() as session:
+        jobs = session.scalars(
+            select(SyncJob)
+            .order_by(SyncJob.created_at.desc())
+            .limit(limit)
+        ).all()
+
+        return JSONResponse(content={
+            "jobs": [
+                {
+                    "job_id": job.id,
+                    "status": job.status,
+                    "job_type": job.job_type,
+                    "orders_processed": job.orders_processed,
+                    "chunks_completed": job.chunks_completed,
+                    "total_chunks": job.total_chunks,
+                    "created_at": job.created_at.isoformat(),
+                    "last_error": job.last_error,
+                }
+                for job in jobs
+            ]
+        })
+
+
+@app.get("/sync/jobs/{job_id}")
+def get_sync_job(job_id: str) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    with SessionLocal() as session:
+        job = session.get(SyncJob, job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "job_not_found"},
+            )
+
+        progress = 0.0
+        if job.total_chunks:
+            progress = round(
+                job.chunks_completed / job.total_chunks * 100,
+                2,
+            )
+
+        return JSONResponse(content={
+            "job_id": job.id,
+            "marketplace": job.marketplace,
+            "job_type": job.job_type,
+            "status": job.status,
+            "date_from": job.date_from.isoformat(),
+            "date_to": job.date_to.isoformat(),
+            "orders_processed": job.orders_processed,
+            "chunks_completed": job.chunks_completed,
+            "total_chunks": job.total_chunks,
+            "progress_percent": progress,
+            "current_chunk_from": (
+                job.current_chunk_from.isoformat()
+                if job.current_chunk_from else None
+            ),
+            "current_chunk_to": (
+                job.current_chunk_to.isoformat()
+                if job.current_chunk_to else None
+            ),
+            "started_at": (
+                job.started_at.isoformat()
+                if job.started_at else None
+            ),
+            "finished_at": (
+                job.finished_at.isoformat()
+                if job.finished_at else None
+            ),
+            "last_error": job.last_error,
+        })
+
+
+@app.post("/sync/mercadolibre/yesterday")
+async def sync_yesterday_now() -> JSONResponse:
+    try:
+        result = await run_previous_day_sync()
+        return JSONResponse(content=result)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "detail": str(exc)},
+        )
+
+
+@app.get("/api/automation/daily-status")
+def daily_sync_status() -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    mexico_tz = ZoneInfo("America/Mexico_City")
+    now_local = datetime.now(mexico_tz)
+    previous_date = now_local.date() - timedelta(days=1)
+    sync_type = f"DAILY_ORDERS_{previous_date.isoformat()}"
+
+    with SessionLocal() as session:
+        latest = session.scalar(
+            select(SyncLog)
+            .where(
+                SyncLog.marketplace == "MERCADO_LIBRE",
+                SyncLog.sync_type.like("DAILY_ORDERS_%"),
+            )
+            .order_by(SyncLog.started_at.desc())
+            .limit(1)
+        )
+
+        today_run = session.scalar(
+            select(SyncLog).where(
+                SyncLog.marketplace == "MERCADO_LIBRE",
+                SyncLog.sync_type == sync_type,
+            )
+        )
+
+    next_run_date = now_local.date()
+    if now_local.hour >= 1:
+        next_run_date += timedelta(days=1)
+
+    next_run = datetime.combine(
+        next_run_date,
+        datetime.min.time().replace(hour=1),
+        tzinfo=mexico_tz,
+    )
+
+    return JSONResponse(content={
+        "enabled": True,
+        "timezone": "America/Mexico_City",
+        "schedule": "01:00",
+        "previous_day": previous_date.isoformat(),
+        "previous_day_status": (
+            today_run.status if today_run else "PENDING"
+        ),
+        "next_run": next_run.isoformat(),
+        "last_run": (
+            {
+                "sync_type": latest.sync_type,
+                "status": latest.status,
+                "records_processed": latest.records_processed,
+                "started_at": latest.started_at.isoformat(),
+                "finished_at": (
+                    latest.finished_at.isoformat()
+                    if latest.finished_at else None
+                ),
+                "error": latest.error_message,
+            }
+            if latest else None
+        ),
+    })
 
 
 @app.post("/sync/mercadolibre/orders")
@@ -1298,7 +1676,7 @@ async def mercadolibre_webhook(request: Request) -> JSONResponse:
 
     return JSONResponse(status_code=200, content={"status": "received"})
 @app.get("/api/dashboard/summary")
-def dashboard_summary(
+async def dashboard_summary(
     days: int = Query(default=30, ge=1, le=730),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
@@ -1443,25 +1821,34 @@ def dashboard_summary(
             params,
         ).mappings().all()
 
-        categories = session.execute(
+        category_ids = session.execute(
             text(
                 """
-                SELECT DISTINCT category_value
+                SELECT DISTINCT category_id
                 FROM (
-                    SELECT
-                        NULLIF(UPPER(COALESCE(oi.raw_data #>> '{item,category_id}', '')), '') AS category_value
-                    FROM order_items oi
-                    UNION
-                    SELECT
-                        NULLIF(UPPER(COALESCE(oi.raw_data #>> '{item,domain_id}', '')), '') AS category_value
+                    SELECT NULLIF(
+                        UPPER(
+                            COALESCE(
+                                oi.raw_data #>> '{item,category_id}',
+                                ''
+                            )
+                        ),
+                        ''
+                    ) AS category_id
                     FROM order_items oi
                 ) q
-                WHERE category_value IS NOT NULL
-                ORDER BY category_value
+                WHERE category_id IS NOT NULL
+                  AND category_id LIKE 'MLM%'
+                ORDER BY category_id
                 LIMIT 500
                 """
             )
         ).scalars().all()
+
+        categories = await resolve_category_names(
+            category_ids,
+            session,
+        )
 
     return JSONResponse(
         content={
@@ -2329,6 +2716,7 @@ border-radius:10px;margin-bottom:14px}
 <nav class="nav">
 <a href="/dashboard">Dashboard</a>
 <a class="active" href="/full">Inventario FULL</a>
+<a href="/automation">Automatizaciones</a>
 <a href="/docs">API y sincronización</a>
 </nav>
 </aside>
@@ -2572,6 +2960,7 @@ def dashboard() -> HTMLResponse:
     <nav class="nav">
       <a class="active" href="/dashboard">Dashboard</a>
       <a href="/full">Inventario FULL</a>
+      <a href="/automation">Automatizaciones</a>
       <a href="/docs">API y sincronización</a>
       <a href="/reports/mercadolibre/summary?days=30">Resumen JSON</a>
     </nav>
@@ -2746,11 +3135,13 @@ async function loadDashboard() {
     const knownOptions = new Set(
       Array.from(categorySelect.options).map(option => option.value)
     );
-    (data.categories || []).forEach(value => {
+    (data.categories || []).forEach(categoryItem => {
+      const value = categoryItem.id;
       if (!knownOptions.has(value)) {
         const option = document.createElement('option');
         option.value = value;
-        option.textContent = value;
+        option.textContent =
+          categoryItem.label || categoryItem.name || value;
         categorySelect.appendChild(option);
       }
     });
