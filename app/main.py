@@ -2,7 +2,9 @@ import asyncio
 import io
 import math
 import os
+import smtplib
 import uuid
+from email.message import EmailMessage
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -11,7 +13,7 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, StreamingResponse
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -36,6 +38,20 @@ MELI_CLIENT_ID = os.getenv("MELI_CLIENT_ID", "")
 MELI_CLIENT_SECRET = os.getenv("MELI_CLIENT_SECRET", "")
 MELI_REDIRECT_URI = os.getenv("MELI_REDIRECT_URI", "")
 SERVICE_ROLE = os.getenv("SERVICE_ROLE", "all").strip().lower()
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME).strip()
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").strip().lower() == "true"
+FULL_REPORT_RECIPIENTS = [
+    email.strip()
+    for email in os.getenv(
+        "FULL_REPORT_RECIPIENTS",
+        "danidarwish@gmail.com,abraham.darwish@yapanizcel.com.mx",
+    ).split(",")
+    if email.strip()
+]
 
 
 def utcnow() -> datetime:
@@ -207,6 +223,25 @@ class Payment(Base):
     order: Mapped[Order] = relationship(back_populates="payments")
 
 
+class AutomationRun(Base):
+    __tablename__ = "automation_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    automation_name: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="PENDING")
+    records_processed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utcnow,
+    )
+
+
 class ProductCatalog(Base):
     __tablename__ = "product_catalog"
     __table_args__ = (
@@ -376,18 +411,19 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="1.0.3",
+    version="1.1.0",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
 worker_task: asyncio.Task | None = None
 daily_scheduler_task: asyncio.Task | None = None
+automation_scheduler_task: asyncio.Task | None = None
 full_sync_tasks: dict[str, asyncio.Task] = {}
 
 
 @app.on_event("startup")
 async def startup() -> None:
-    global worker_task, daily_scheduler_task
+    global worker_task, daily_scheduler_task, automation_scheduler_task
 
     if engine is not None:
         Base.metadata.create_all(bind=engine)
@@ -413,8 +449,8 @@ async def startup() -> None:
     if SERVICE_ROLE in ("all", "worker"):
         print({"service_role": SERVICE_ROLE, "worker": "started"})
         worker_task = asyncio.create_task(sync_worker_loop())
-        daily_scheduler_task = asyncio.create_task(
-            daily_sync_scheduler_loop()
+        automation_scheduler_task = asyncio.create_task(
+            automation_scheduler_loop()
         )
     else:
         print({"service_role": SERVICE_ROLE, "worker": "disabled"})
@@ -1557,9 +1593,460 @@ async def sync_product_catalog() -> dict[str, Any]:
         }
 
 
+def build_full_shipment_workbook(
+    rows: list[dict[str, Any]],
+) -> tuple[bytes, str]:
+    import xlsxwriter
+
+    rows_to_send = [
+        row for row in rows
+        if int(row.get("suggested_shipment") or 0) > 0
+    ]
+
+    output = io.BytesIO()
+    workbook = xlsxwriter.Workbook(output, {"in_memory": True})
+    worksheet = workbook.add_worksheet("Envio FULL sugerido")
+
+    title_format = workbook.add_format({
+        "bold": True,
+        "font_size": 16,
+        "font_color": "#FFFFFF",
+        "bg_color": "#111827",
+        "align": "left",
+        "valign": "vcenter",
+    })
+    subtitle_format = workbook.add_format({
+        "font_color": "#475467",
+        "italic": True,
+    })
+    header_format = workbook.add_format({
+        "bold": True,
+        "font_color": "#FFFFFF",
+        "bg_color": "#344054",
+        "border": 1,
+        "align": "center",
+        "valign": "vcenter",
+    })
+    text_format = workbook.add_format({
+        "border": 1,
+        "valign": "top",
+    })
+    integer_format = workbook.add_format({
+        "border": 1,
+        "num_format": "0",
+        "align": "right",
+    })
+    decimal_format = workbook.add_format({
+        "border": 1,
+        "num_format": "0.00",
+        "align": "right",
+    })
+    send_format = workbook.add_format({
+        "bold": True,
+        "border": 1,
+        "num_format": "0",
+        "align": "right",
+        "bg_color": "#ECFDF3",
+        "font_color": "#067647",
+    })
+
+    worksheet.merge_range(
+        "A1:P1",
+        "GETAC — Envío sugerido a Mercado Libre FULL",
+        title_format,
+    )
+    worksheet.write(
+        "A2",
+        (
+            "Objetivo: cubrir 30 días usando la mayor demanda entre "
+            "ventas de 30 días y tendencias suavizadas de 7 y 14 días."
+        ),
+        subtitle_format,
+    )
+    worksheet.write(
+        "A3",
+        f"Generado: {utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+        subtitle_format,
+    )
+
+    headers = [
+        "SKU",
+        "Producto",
+        "Inventory ID",
+        "Item ID",
+        "Variation ID",
+        "Stock disponible FULL",
+        "No disponible",
+        "Ventas 7 días",
+        "Ventas 14 días",
+        "Ventas 30 días",
+        "Proyección ritmo 7 días",
+        "Proyección ritmo 14 días",
+        "Objetivo stock 30 días",
+        "Cobertura estimada días",
+        "Cantidad sugerida a enviar",
+        "Prioridad",
+    ]
+
+    start_row = 4
+    for col, header in enumerate(headers):
+        worksheet.write(start_row, col, header, header_format)
+
+    for row_index, row in enumerate(rows_to_send, start=start_row + 1):
+        worksheet.write(row_index, 0, row.get("sku") or "", text_format)
+        worksheet.write(row_index, 1, row.get("title") or "", text_format)
+        worksheet.write(row_index, 2, row.get("inventory_id") or "", text_format)
+        worksheet.write(row_index, 3, row.get("item_id") or "", text_format)
+        worksheet.write(row_index, 4, row.get("variation_id") or "", text_format)
+        worksheet.write_number(row_index, 5, int(row.get("available_quantity") or 0), integer_format)
+        worksheet.write_number(row_index, 6, int(row.get("not_available_quantity") or 0), integer_format)
+        worksheet.write_number(row_index, 7, int(row.get("sales_7") or 0), integer_format)
+        worksheet.write_number(row_index, 8, int(row.get("sales_14") or 0), integer_format)
+        worksheet.write_number(row_index, 9, int(row.get("sales_30") or 0), integer_format)
+        worksheet.write_number(row_index, 10, float(row.get("projected_7") or 0), decimal_format)
+        worksheet.write_number(row_index, 11, float(row.get("projected_14") or 0), decimal_format)
+        worksheet.write_number(row_index, 12, int(row.get("target_30_days") or 0), integer_format)
+        worksheet.write_number(row_index, 13, float(row.get("coverage_days") or 0), decimal_format)
+        worksheet.write_number(row_index, 14, int(row.get("suggested_shipment") or 0), send_format)
+        worksheet.write(row_index, 15, row.get("priority") or "", text_format)
+
+    worksheet.freeze_panes(start_row + 1, 0)
+    worksheet.autofilter(
+        start_row,
+        0,
+        start_row + max(len(rows_to_send), 1),
+        len(headers) - 1,
+    )
+    worksheet.set_column("A:A", 22)
+    worksheet.set_column("B:B", 48)
+    worksheet.set_column("C:E", 20)
+    worksheet.set_column("F:J", 17)
+    worksheet.set_column("K:P", 22)
+    worksheet.set_row(0, 28)
+
+    total_row = start_row + len(rows_to_send) + 2
+    worksheet.write(total_row, 13, "TOTAL A ENVIAR", header_format)
+    worksheet.write_formula(
+        total_row,
+        14,
+        f"=SUM(O{start_row + 2}:O{start_row + len(rows_to_send) + 1})",
+        send_format,
+    )
+
+    workbook.close()
+    output.seek(0)
+    filename = f"GETAC_envio_FULL_{utcnow().strftime('%Y-%m-%d')}.xlsx"
+    return output.getvalue(), filename
+
+
+def send_full_report_email(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD or not SMTP_FROM:
+        raise RuntimeError(
+            "SMTP no configurado. Agrega SMTP_HOST, SMTP_PORT, "
+            "SMTP_USERNAME, SMTP_PASSWORD y SMTP_FROM en Railway."
+        )
+
+    workbook_bytes, filename = build_full_shipment_workbook(rows)
+    rows_to_send = [row for row in rows if int(row.get("suggested_shipment") or 0) > 0]
+    total_units = sum(int(row.get("suggested_shipment") or 0) for row in rows_to_send)
+    critical_count = sum(1 for row in rows_to_send if row.get("priority") == "CRITICO")
+    high_count = sum(1 for row in rows_to_send if row.get("priority") == "ALTO")
+
+    if critical_count > 0:
+        urgency = "URGENTE"
+    elif high_count > 0:
+        urgency = "ATENCION"
+    else:
+        urgency = "FULL OK"
+
+    message = EmailMessage()
+    message["Subject"] = (
+        f"GETAC ERP | {urgency} | "
+        f"{critical_count} críticos | Enviar {total_units}"
+    )
+    message["From"] = SMTP_FROM
+    message["To"] = ", ".join(FULL_REPORT_RECIPIENTS)
+
+    body = f"""GETAC ERP — Reabasto Mercado Libre FULL
+
+Fecha: {datetime.now(ZoneInfo('America/Mexico_City')).strftime('%Y-%m-%d')}
+
+SKU analizados: {len(rows)}
+SKU para enviar: {len(rows_to_send)}
+SKU críticos: {critical_count}
+SKU prioridad alta: {high_count}
+Unidades sugeridas para enviar: {total_units}
+
+Se adjunta el Excel con el detalle completo.
+"""
+    message.set_content(body)
+    message.add_attachment(
+        workbook_bytes,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
+        if SMTP_USE_TLS:
+            server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(message)
+
+    return {
+        "recipients": FULL_REPORT_RECIPIENTS,
+        "filename": filename,
+        "sku_to_send": len(rows_to_send),
+        "critical_count": critical_count,
+        "total_units": total_units,
+    }
+
+
+def begin_automation_run(
+    session,
+    automation_name: str,
+    scheduled_for: datetime,
+) -> AutomationRun:
+    existing = session.scalar(
+        select(AutomationRun).where(
+            AutomationRun.automation_name == automation_name,
+            AutomationRun.scheduled_for == scheduled_for,
+            AutomationRun.status.in_(["RUNNING", "SUCCESS"]),
+        )
+    )
+    if existing:
+        return existing
+
+    run = AutomationRun(
+        id=str(uuid.uuid4()),
+        automation_name=automation_name,
+        scheduled_for=scheduled_for,
+        status="RUNNING",
+        started_at=utcnow(),
+    )
+    session.add(run)
+    session.commit()
+    return run
+
+
+def finish_automation_run(
+    session,
+    run_id: str,
+    *,
+    status: str,
+    records_processed: int = 0,
+    details: dict[str, Any] | None = None,
+    error_message: str | None = None,
+) -> None:
+    run = session.get(AutomationRun, run_id)
+    if run:
+        run.status = status
+        run.records_processed = records_processed
+        run.details = details
+        run.error_message = error_message
+        run.finished_at = utcnow()
+        session.commit()
+
+
+async def wait_for_full_sync_completion(
+    timeout_seconds: int = 3300,
+) -> dict[str, Any]:
+    deadline = utcnow() + timedelta(seconds=timeout_seconds)
+
+    while utcnow() < deadline:
+        if SessionLocal is None:
+            raise RuntimeError("database_not_configured")
+
+        with SessionLocal() as session:
+            run = session.scalar(
+                select(FullSyncRun)
+                .order_by(FullSyncRun.created_at.desc())
+                .limit(1)
+            )
+
+            if run and run.status == "SUCCESS":
+                return {
+                    "status": run.status,
+                    "inventories_processed": run.inventories_processed,
+                }
+
+            if run and run.status in ("ERROR", "INTERRUPTED"):
+                raise RuntimeError(run.last_error or run.status)
+
+        await asyncio.sleep(30)
+
+    raise TimeoutError("La actualización FULL no terminó dentro del tiempo esperado.")
+
+
+async def run_scheduled_orders(scheduled_for: datetime) -> dict[str, Any]:
+    if SessionLocal is None:
+        raise RuntimeError("database_not_configured")
+
+    with SessionLocal() as session:
+        run = begin_automation_run(session, "ORDERS_1AM", scheduled_for)
+        if run.status == "SUCCESS":
+            return run.details or {"status": "already_completed"}
+        run_id = run.id
+
+    try:
+        result = await run_previous_day_sync()
+        with SessionLocal() as session:
+            finish_automation_run(
+                session,
+                run_id,
+                status="SUCCESS",
+                records_processed=int(result.get("records_processed") or 0),
+                details=result,
+            )
+        return result
+    except Exception as exc:
+        with SessionLocal() as session:
+            finish_automation_run(
+                session,
+                run_id,
+                status="ERROR",
+                error_message=str(exc)[:4000],
+            )
+        raise
+
+
+async def run_scheduled_full(scheduled_for: datetime) -> dict[str, Any]:
+    if SessionLocal is None:
+        raise RuntimeError("database_not_configured")
+
+    with SessionLocal() as session:
+        run = begin_automation_run(session, "FULL_2AM", scheduled_for)
+        if run.status == "SUCCESS":
+            return run.details or {"status": "already_completed"}
+        run_id = run.id
+
+    try:
+        response = await start_full_sync()
+        payload = json.loads(response.body.decode("utf-8"))
+        if response.status_code not in (202, 409):
+            raise RuntimeError(str(payload))
+
+        result = await wait_for_full_sync_completion()
+
+        with SessionLocal() as session:
+            finish_automation_run(
+                session,
+                run_id,
+                status="SUCCESS",
+                records_processed=int(result.get("inventories_processed") or 0),
+                details=result,
+            )
+        return result
+    except Exception as exc:
+        with SessionLocal() as session:
+            finish_automation_run(
+                session,
+                run_id,
+                status="ERROR",
+                error_message=str(exc)[:4000],
+            )
+        raise
+
+
+async def run_scheduled_report(scheduled_for: datetime) -> dict[str, Any]:
+    if SessionLocal is None:
+        raise RuntimeError("database_not_configured")
+
+    with SessionLocal() as session:
+        run = begin_automation_run(session, "REPORT_3AM", scheduled_for)
+        if run.status == "SUCCESS":
+            return run.details or {"status": "already_completed"}
+        run_id = run.id
+
+    try:
+        with SessionLocal() as session:
+            rows = full_replenishment_rows(session, "")
+        result = await asyncio.to_thread(send_full_report_email, rows)
+
+        with SessionLocal() as session:
+            finish_automation_run(
+                session,
+                run_id,
+                status="SUCCESS",
+                records_processed=len(rows),
+                details=result,
+            )
+        return result
+    except Exception as exc:
+        with SessionLocal() as session:
+            finish_automation_run(
+                session,
+                run_id,
+                status="ERROR",
+                error_message=str(exc)[:4000],
+            )
+        raise
+
+
+async def automation_scheduler_loop() -> None:
+    mexico_tz = ZoneInfo("America/Mexico_City")
+
+    while True:
+        try:
+            now_local = datetime.now(mexico_tz)
+            current_date = now_local.date()
+
+            schedules = [
+                (1, "ORDERS_1AM", run_scheduled_orders),
+                (2, "FULL_2AM", run_scheduled_full),
+                (3, "REPORT_3AM", run_scheduled_report),
+            ]
+
+            for hour, name, runner in schedules:
+                scheduled_local = datetime.combine(
+                    current_date,
+                    datetime.min.time().replace(hour=hour),
+                    tzinfo=mexico_tz,
+                )
+                scheduled_utc = scheduled_local.astimezone(timezone.utc)
+
+                if now_local >= scheduled_local:
+                    should_run = True
+                    if SessionLocal is not None:
+                        with SessionLocal() as session:
+                            existing = session.scalar(
+                                select(AutomationRun).where(
+                                    AutomationRun.automation_name == name,
+                                    AutomationRun.scheduled_for == scheduled_utc,
+                                    AutomationRun.status.in_(["RUNNING", "SUCCESS"]),
+                                )
+                            )
+                            should_run = existing is None
+
+                    if should_run:
+                        for attempt in range(3):
+                            try:
+                                await runner(scheduled_utc)
+                                break
+                            except Exception as exc:
+                                print({
+                                    "event": "automation_retry",
+                                    "automation": name,
+                                    "attempt": attempt + 1,
+                                    "error": str(exc),
+                                })
+                                if attempt < 2:
+                                    await asyncio.sleep(300)
+
+            await asyncio.sleep(60)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print({"event": "automation_scheduler_error", "error": str(exc)})
+            await asyncio.sleep(300)
+
+
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "1.0.3", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "1.1.0", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -1570,7 +2057,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "1.0.3",
+        "version": "1.1.0",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
@@ -1600,6 +2087,7 @@ def database_health() -> JSONResponse:
                     "webhook_events",
                     "sync_logs",
                     "sync_jobs",
+                    "automation_runs",
                     "product_catalog",
                     "full_inventory",
                     "full_sync_runs",
@@ -3107,65 +3595,17 @@ def download_full_shipment(
     with SessionLocal() as session:
         rows = full_replenishment_rows(session, search_value)
 
-    rows_to_send = [
-        row for row in rows
-        if row["suggested_shipment"] > 0
-    ]
+    workbook_bytes, filename = build_full_shipment_workbook(rows)
 
-    output = io.BytesIO()
-
-    import xlsxwriter
-
-    workbook = xlsxwriter.Workbook(output, {"in_memory": True})
-    worksheet = workbook.add_worksheet("Envio FULL sugerido")
-
-    title_format = workbook.add_format({
-        "bold": True,
-        "font_size": 16,
-        "font_color": "#FFFFFF",
-        "bg_color": "#111827",
-        "align": "left",
-        "valign": "vcenter",
-    })
-    subtitle_format = workbook.add_format({
-        "font_color": "#475467",
-        "italic": True,
-    })
-    header_format = workbook.add_format({
-        "bold": True,
-        "font_color": "#FFFFFF",
-        "bg_color": "#344054",
-        "border": 1,
-        "align": "center",
-        "valign": "vcenter",
-    })
-    text_format = workbook.add_format({
-        "border": 1,
-        "valign": "top",
-    })
-    integer_format = workbook.add_format({
-        "border": 1,
-        "num_format": "0",
-        "align": "right",
-    })
-    decimal_format = workbook.add_format({
-        "border": 1,
-        "num_format": "0.00",
-        "align": "right",
-    })
-    send_format = workbook.add_format({
-        "bold": True,
-        "border": 1,
-        "num_format": "0",
-        "align": "right",
-        "bg_color": "#ECFDF3",
-        "font_color": "#067647",
-    })
-
-    worksheet.merge_range(
-        "A1:P1",
-        "GETAC — Envío sugerido a Mercado Libre FULL",
-        title_format,
+    return StreamingResponse(
+        io.BytesIO(workbook_bytes),
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
     )
     worksheet.write(
         "A2",

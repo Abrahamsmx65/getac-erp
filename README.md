@@ -1,27 +1,54 @@
-# GETAC ERP v1.0.3 — Corrección definitiva del Dashboard
+# GETAC ERP v1.1 — Automatizaciones y correo
 
-Este hotfix elimina completamente la dependencia de
-`resolve_category_names`.
+## Horarios automáticos
 
-La traducción de categorías se ejecuta directamente dentro del endpoint
-`/api/dashboard/summary`, por lo que ya no puede producirse el error:
+Zona horaria: America/Mexico_City
 
-`NameError: name 'resolve_category_names' is not defined`
+- 1:00 AM — sincroniza las órdenes del día anterior
+- 2:00 AM — actualiza inventario FULL
+- 3:00 AM — recalcula el envío sugerido, genera Excel y lo envía por correo
 
-## No modifica
+## Destinatarios predeterminados
 
-- Sincronización histórica
-- Sincronización FULL
-- Catálogo maestro
-- Reabasto
-- Excel de envío
-- Automatización diaria
+- danidarwish@gmail.com
+- abraham.darwish@yapanizcel.com.mx
 
-## Verificación
+Se pueden cambiar con:
 
-Después del despliegue abre:
+FULL_REPORT_RECIPIENTS=correo1,correo2
 
-- `/dashboard`
-- `/api/dashboard/summary?days=30`
+## Variables de correo necesarias en Railway
 
-Ambas rutas deben responder sin error 500.
+SMTP_HOST
+SMTP_PORT
+SMTP_USERNAME
+SMTP_PASSWORD
+SMTP_FROM
+SMTP_USE_TLS=true
+
+Ejemplo para Gmail:
+
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=tu_correo@gmail.com
+SMTP_PASSWORD=contraseña_de_aplicación
+SMTP_FROM=tu_correo@gmail.com
+SMTP_USE_TLS=true
+
+Importante: Gmail requiere una contraseña de aplicación, no la contraseña normal.
+
+## Nueva página
+
+/automation
+
+Permite:
+
+- ver horarios
+- ejecutar órdenes manualmente
+- ejecutar FULL manualmente
+- enviar el reporte manualmente
+- revisar historial y errores
+
+## Reintentos
+
+Cada automatización reintenta hasta 3 veces, esperando 5 minutos entre intentos.
