@@ -376,7 +376,7 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="1.0.2",
+    version="1.0.3",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
@@ -1559,7 +1559,7 @@ async def sync_product_catalog() -> dict[str, Any]:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "1.0.2", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "1.0.3", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -1570,7 +1570,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "1.0.2",
+        "version": "1.0.3",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
@@ -2223,9 +2223,109 @@ async def dashboard_summary(
             )
         ).scalars().all()
 
-        categories = await resolve_category_names(
-            category_ids,
-            session,
+        clean_category_ids = sorted({
+            str(value).strip().upper()
+            for value in category_ids
+            if value and str(value).strip().upper().startswith("MLM")
+        })
+
+        cached_rows = session.scalars(
+            select(CategoryCache).where(
+                CategoryCache.category_id.in_(clean_category_ids)
+            )
+        ).all() if clean_category_ids else []
+
+        cached_categories = {
+            row.category_id: row
+            for row in cached_rows
+        }
+
+        missing_category_ids = [
+            category_id
+            for category_id in clean_category_ids
+            if category_id not in cached_categories
+        ]
+
+        if missing_category_ids:
+            async with httpx.AsyncClient(timeout=20) as client:
+                for category_id in missing_category_ids:
+                    category_name = category_id
+                    category_path = []
+
+                    try:
+                        response = await client.get(
+                            f"https://api.mercadolibre.com/categories/{category_id}"
+                        )
+                        if response.status_code == 200:
+                            payload = response.json()
+                            category_name = (
+                                payload.get("name")
+                                or category_id
+                            )
+                            category_path = (
+                                payload.get("path_from_root")
+                                or []
+                            )
+                    except Exception:
+                        pass
+
+                    session.merge(
+                        CategoryCache(
+                            category_id=category_id,
+                            name=category_name,
+                            path_from_root=category_path,
+                            updated_at=utcnow(),
+                        )
+                    )
+
+            session.commit()
+
+            cached_rows = session.scalars(
+                select(CategoryCache).where(
+                    CategoryCache.category_id.in_(
+                        clean_category_ids
+                    )
+                )
+            ).all()
+
+            cached_categories = {
+                row.category_id: row
+                for row in cached_rows
+            }
+
+        categories = []
+        for category_id in clean_category_ids:
+            cached_category = cached_categories.get(category_id)
+
+            if cached_category is None:
+                categories.append({
+                    "id": category_id,
+                    "name": category_id,
+                    "label": category_id,
+                })
+                continue
+
+            path_names = [
+                item.get("name")
+                for item in (
+                    cached_category.path_from_root or []
+                )
+                if isinstance(item, dict)
+                and item.get("name")
+            ]
+
+            categories.append({
+                "id": category_id,
+                "name": cached_category.name,
+                "label": (
+                    " › ".join(path_names)
+                    if path_names
+                    else cached_category.name
+                ),
+            })
+
+        categories.sort(
+            key=lambda item: item["label"].lower()
         )
 
     return JSONResponse(
