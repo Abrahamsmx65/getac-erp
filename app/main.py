@@ -411,7 +411,7 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="1.1.0",
+    version="1.1.2",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
@@ -1651,7 +1651,7 @@ def build_full_shipment_workbook(
     })
 
     worksheet.merge_range(
-        "A1:P1",
+        "A1:R1",
         "GETAC — Envío sugerido a Mercado Libre FULL",
         title_format,
     )
@@ -1676,6 +1676,8 @@ def build_full_shipment_workbook(
         "Item ID",
         "Variation ID",
         "Stock disponible FULL",
+        "En transferencia",
+        "Stock considerado",
         "No disponible",
         "Ventas 7 días",
         "Ventas 14 días",
@@ -1699,16 +1701,18 @@ def build_full_shipment_workbook(
         worksheet.write(row_index, 3, row.get("item_id") or "", text_format)
         worksheet.write(row_index, 4, row.get("variation_id") or "", text_format)
         worksheet.write_number(row_index, 5, int(row.get("available_quantity") or 0), integer_format)
-        worksheet.write_number(row_index, 6, int(row.get("not_available_quantity") or 0), integer_format)
-        worksheet.write_number(row_index, 7, int(row.get("sales_7") or 0), integer_format)
-        worksheet.write_number(row_index, 8, int(row.get("sales_14") or 0), integer_format)
-        worksheet.write_number(row_index, 9, int(row.get("sales_30") or 0), integer_format)
-        worksheet.write_number(row_index, 10, float(row.get("projected_7") or 0), decimal_format)
-        worksheet.write_number(row_index, 11, float(row.get("projected_14") or 0), decimal_format)
-        worksheet.write_number(row_index, 12, int(row.get("target_30_days") or 0), integer_format)
-        worksheet.write_number(row_index, 13, float(row.get("coverage_days") or 0), decimal_format)
-        worksheet.write_number(row_index, 14, int(row.get("suggested_shipment") or 0), send_format)
-        worksheet.write(row_index, 15, row.get("priority") or "", text_format)
+        worksheet.write_number(row_index, 6, int(row.get("transfer_quantity") or 0), integer_format)
+        worksheet.write_number(row_index, 7, int(row.get("considered_stock") or 0), integer_format)
+        worksheet.write_number(row_index, 8, int(row.get("not_available_quantity") or 0), integer_format)
+        worksheet.write_number(row_index, 9, int(row.get("sales_7") or 0), integer_format)
+        worksheet.write_number(row_index, 10, int(row.get("sales_14") or 0), integer_format)
+        worksheet.write_number(row_index, 11, int(row.get("sales_30") or 0), integer_format)
+        worksheet.write_number(row_index, 12, float(row.get("projected_7") or 0), decimal_format)
+        worksheet.write_number(row_index, 13, float(row.get("projected_14") or 0), decimal_format)
+        worksheet.write_number(row_index, 14, int(row.get("target_30_days") or 0), integer_format)
+        worksheet.write_number(row_index, 15, float(row.get("coverage_days") or 0), decimal_format)
+        worksheet.write_number(row_index, 16, int(row.get("suggested_shipment") or 0), send_format)
+        worksheet.write(row_index, 17, row.get("priority") or "", text_format)
 
     worksheet.freeze_panes(start_row + 1, 0)
     worksheet.autofilter(
@@ -1721,15 +1725,15 @@ def build_full_shipment_workbook(
     worksheet.set_column("B:B", 48)
     worksheet.set_column("C:E", 20)
     worksheet.set_column("F:J", 17)
-    worksheet.set_column("K:P", 22)
+    worksheet.set_column("K:R", 22)
     worksheet.set_row(0, 28)
 
     total_row = start_row + len(rows_to_send) + 2
-    worksheet.write(total_row, 13, "TOTAL A ENVIAR", header_format)
+    worksheet.write(total_row, 15, "TOTAL A ENVIAR", header_format)
     worksheet.write_formula(
         total_row,
-        14,
-        f"=SUM(O{start_row + 2}:O{start_row + len(rows_to_send) + 1})",
+        16,
+        f"=SUM(Q{start_row + 2}:Q{start_row + len(rows_to_send) + 1})",
         send_format,
     )
 
@@ -2046,7 +2050,7 @@ async def automation_scheduler_loop() -> None:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "1.1.0", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "1.1.2", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -2057,7 +2061,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "1.1.0",
+        "version": "1.1.2",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
@@ -3072,6 +3076,17 @@ def product_model_detail(
     )
 
 
+def unavailable_status_quantity(
+    detail: list[dict[str, Any]] | None,
+    status_name: str,
+) -> int:
+    total = 0
+    for item in detail or []:
+        if str(item.get("status") or "").lower() == status_name.lower():
+            total += int(item.get("quantity") or 0)
+    return total
+
+
 def full_replenishment_rows(
     session,
     search_value: str = "",
@@ -3119,6 +3134,7 @@ def full_replenishment_rows(
                 fi.title,
                 fi.available_quantity,
                 fi.not_available_quantity,
+                fi.not_available_detail,
                 COALESCE(s.sales_7, 0) AS sales_7,
                 COALESCE(s.sales_14, 0) AS sales_14,
                 COALESCE(s.sales_30, 0) AS sales_30
@@ -3150,6 +3166,14 @@ def full_replenishment_rows(
         sales_14 = int(row["sales_14"] or 0)
         sales_30 = int(row["sales_30"] or 0)
         available = int(row["available_quantity"] or 0)
+        transfer_quantity = unavailable_status_quantity(
+            row["not_available_detail"],
+            "transfer",
+        )
+        considered_stock = (
+            available
+            + transfer_quantity
+        )
 
         projected_7 = sales_7 * 30 / 7
         projected_14 = sales_14 * 30 / 14
@@ -3166,14 +3190,14 @@ def full_replenishment_rows(
             adjusted_14,
         ))
 
-        suggested_shipment = max(0, target_30_days - available)
+        suggested_shipment = max(0, target_30_days - considered_stock)
 
         coverage_days = None
         if target_30_days > 0:
             daily_target = target_30_days / 30
             if daily_target > 0:
                 coverage_days = round(
-                    available / daily_target,
+                    considered_stock / daily_target,
                     1,
                 )
 
@@ -3195,6 +3219,8 @@ def full_replenishment_rows(
             "sku": row["sku"],
             "title": row["title"],
             "available_quantity": available,
+            "transfer_quantity": transfer_quantity,
+            "considered_stock": considered_stock,
             "not_available_quantity": int(
                 row["not_available_quantity"] or 0
             ),
@@ -3208,6 +3234,21 @@ def full_replenishment_rows(
             "coverage_days": coverage_days,
             "priority": priority,
         })
+
+    priority_order = {
+        "CRITICO": 0,
+        "ALTO": 1,
+        "MEDIO": 2,
+        "OK": 3,
+    }
+
+    result.sort(
+        key=lambda row: (
+            priority_order.get(row.get("priority"), 9),
+            -int(row.get("suggested_shipment") or 0),
+            str(row.get("sku") or ""),
+        )
+    )
 
     return result
 
@@ -3825,7 +3866,7 @@ border-radius:10px;margin-bottom:14px}
 <section class="summary">
 <div class="card"><div class="label">SKUs FULL</div>
 <div id="skuCount" class="value">0</div></div>
-<div class="card"><div class="label">Stock disponible</div>
+<div class="card"><div class="label">Stock considerado</div>
 <div id="stockTotal" class="value">0</div></div>
 <div class="card"><div class="label">Ventas del periodo</div>
 <div id="salesTotal" class="value">0</div></div>
@@ -3837,7 +3878,9 @@ border-radius:10px;margin-bottom:14px}
 <table>
 <thead><tr>
 <th>SKU</th><th>Producto</th><th>Inventory ID</th>
-<th class="num">Stock FULL</th><th class="num">No disponible</th>
+<th class="num">Disponible</th><th class="num">Transferencia</th>
+<th class="num">Stock considerado</th>
+<th class="num">No disponible</th>
 <th class="num">Ventas 7d</th><th class="num">Ventas 30d</th>
 <th class="num">Objetivo 30d</th><th class="num">Enviar</th>
 <th class="num">Días de stock</th>
@@ -3866,19 +3909,21 @@ if(!r.ok)throw new Error('Error '+r.status);
 const d=await r.json(),items=d.items||[];
 document.getElementById('skuCount').textContent=integer.format(items.length);
 document.getElementById('stockTotal').textContent=integer.format(
-items.reduce((a,x)=>a+x.available_quantity,0));
+items.reduce((a,x)=>a+(x.considered_stock||0),0));
 document.getElementById('salesTotal').textContent=integer.format(
 items.reduce((a,x)=>a+x.sales_30,0));
 document.getElementById('riskCount').textContent=integer.format(
 items.filter(x=>x.suggested_shipment>0).length);
 document.getElementById('body').innerHTML=items.map(x=>{
 let cls='';const daysStock=x.sales_30>0?
-x.available_quantity/(x.sales_30/30):null;
+(x.considered_stock||0)/(x.sales_30/30):null;
 if(daysStock!==null){
 cls=daysStock<=15?'risk-high':daysStock<=30?'risk-mid':'risk-ok'}
 return `<tr><td><strong>${esc(x.sku||'SIN SKU')}</strong></td>
 <td>${esc(x.title||'')}</td><td>${esc(x.inventory_id)}</td>
 <td class="num">${integer.format(x.available_quantity)}</td>
+<td class="num">${integer.format(x.transfer_quantity||0)}</td>
+<td class="num"><strong>${integer.format(x.considered_stock||0)}</strong></td>
 <td class="num">${integer.format(x.not_available_quantity)}</td>
 <td class="num">${integer.format(x.sales_7)}</td>
 <td class="num">${integer.format(x.sales_30)}</td>
@@ -3886,7 +3931,7 @@ return `<tr><td><strong>${esc(x.sku||'SIN SKU')}</strong></td>
 <td class="num"><strong>${integer.format(x.suggested_shipment)}</strong></td>
 <td class="num ${cls}">${
 x.sales_30===0?'Sin ventas':
-(x.available_quantity/(x.sales_30/30)).toFixed(1)
+((x.considered_stock||0)/(x.sales_30/30)).toFixed(1)
 }</td></tr>`}).join('');
 }catch(e){showError('No se pudo cargar FULL: '+e.message)}
 }

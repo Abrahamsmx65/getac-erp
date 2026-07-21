@@ -1,54 +1,36 @@
-# GETAC ERP v1.1 — Automatizaciones y correo
+# GETAC ERP v1.1.2 — Stock FULL real
 
-## Horarios automáticos
+## Lógica definitiva
 
-Zona horaria: America/Mexico_City
+Stock considerado:
 
-- 1:00 AM — sincroniza las órdenes del día anterior
-- 2:00 AM — actualiza inventario FULL
-- 3:00 AM — recalcula el envío sugerido, genera Excel y lo envía por correo
+- Stock disponible FULL
+- Más stock en transferencia dentro de la red de Mercado Libre
 
-## Destinatarios predeterminados
+No se toma en cuenta ingreso planeado.
 
-- danidarwish@gmail.com
-- abraham.darwish@yapanizcel.com.mx
+## Fórmula
 
-Se pueden cambiar con:
+Cantidad sugerida:
 
-FULL_REPORT_RECIPIENTS=correo1,correo2
+Objetivo para 30 días menos:
 
-## Variables de correo necesarias en Railway
+Disponible + Transferencia
 
-SMTP_HOST
-SMTP_PORT
-SMTP_USERNAME
-SMTP_PASSWORD
-SMTP_FROM
-SMTP_USE_TLS=true
+## Incluye
 
-Ejemplo para Gmail:
+- Transferencia automática desde `not_available_detail`
+- Cobertura recalculada con stock considerado
+- Excel usando disponible + transferencia
+- Correo de las 3:00 AM con la misma lógica
+- Prioridades ordenadas:
+  - CRITICO
+  - ALTO
+  - MEDIO
+  - OK
 
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USERNAME=tu_correo@gmail.com
-SMTP_PASSWORD=contraseña_de_aplicación
-SMTP_FROM=tu_correo@gmail.com
-SMTP_USE_TLS=true
+## No incluye
 
-Importante: Gmail requiere una contraseña de aplicación, no la contraseña normal.
-
-## Nueva página
-
-/automation
-
-Permite:
-
-- ver horarios
-- ejecutar órdenes manualmente
-- ejecutar FULL manualmente
-- enviar el reporte manualmente
-- revisar historial y errores
-
-## Reintentos
-
-Cada automatización reintenta hasta 3 veces, esperando 5 minutos entre intentos.
+- Ingreso planeado
+- Captura manual
+- Tabla de planeados
