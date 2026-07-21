@@ -376,7 +376,7 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="1.0.0",
+    version="1.0.2",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
@@ -1559,7 +1559,7 @@ async def sync_product_catalog() -> dict[str, Any]:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "1.0.0", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "1.0.2", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -1570,7 +1570,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "1.0.0",
+        "version": "1.0.2",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
