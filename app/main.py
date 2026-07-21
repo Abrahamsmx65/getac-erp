@@ -292,6 +292,49 @@ class ProductCatalog(Base):
     )
 
 
+class MissingSkuRepairRun(Base):
+    __tablename__ = "missing_sku_repair_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="PENDING",
+    )
+    total_pending: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    processed: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    resolved: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    unresolved: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utcnow,
+    )
+
+
 class FullInventory(Base):
     __tablename__ = "full_inventory"
 
@@ -411,7 +454,7 @@ if DATABASE_URL:
 
 app = FastAPI(
     title="GETAC ERP API",
-    version="1.1.2",
+    version="1.2.0",
     description="Backend para sincronizar Mercado Libre y Amazon con PostgreSQL.",
 )
 
@@ -419,6 +462,7 @@ worker_task: asyncio.Task | None = None
 daily_scheduler_task: asyncio.Task | None = None
 automation_scheduler_task: asyncio.Task | None = None
 full_sync_tasks: dict[str, asyncio.Task] = {}
+missing_sku_tasks: dict[str, asyncio.Task] = {}
 
 
 @app.on_event("startup")
@@ -444,6 +488,21 @@ async def startup() -> None:
                         "Ejecución interrumpida por un despliegue "
                         "o reinicio anterior."
                     )
+                stale_repairs = session.scalars(
+                    select(MissingSkuRepairRun).where(
+                        MissingSkuRepairRun.status.in_(
+                            ["PENDING", "RUNNING"]
+                        )
+                    )
+                ).all()
+                for stale_repair in stale_repairs:
+                    stale_repair.status = "INTERRUPTED"
+                    stale_repair.finished_at = utcnow()
+                    stale_repair.last_error = (
+                        "Ejecución interrumpida por un "
+                        "despliegue anterior."
+                    )
+
                 session.commit()
 
     if SERVICE_ROLE in ("all", "worker"):
@@ -1369,6 +1428,232 @@ async def sync_full_inventory_run(run_id: str) -> None:
         full_sync_tasks.pop(run_id, None)
 
 
+def extract_seller_sku_complete(data: dict[str, Any] | None) -> str | None:
+    if not data:
+        return None
+
+    direct_candidates = [
+        data.get("seller_sku"),
+        data.get("seller_custom_field"),
+        data.get("sku"),
+    ]
+    for candidate in direct_candidates:
+        if candidate is not None and str(candidate).strip():
+            return str(candidate).strip().upper()
+
+    for attribute in data.get("attributes") or []:
+        attribute_id = str(attribute.get("id") or "").upper()
+        if attribute_id not in (
+            "SELLER_SKU",
+            "SELLER_CUSTOM_FIELD",
+            "SKU",
+        ):
+            continue
+
+        values = [
+            attribute.get("value_name"),
+            attribute.get("value_id"),
+        ]
+
+        for item in attribute.get("values") or []:
+            if isinstance(item, dict):
+                values.extend([
+                    item.get("name"),
+                    item.get("id"),
+                ])
+
+        for value in values:
+            if value is not None and str(value).strip():
+                return str(value).strip().upper()
+
+    return None
+
+
+def apply_resolved_sku(
+    session,
+    catalog_row: ProductCatalog,
+    sku: str,
+) -> None:
+    normalized_sku = sku.strip().upper()
+    model, color, size = parse_sku_parts(normalized_sku)
+
+    catalog_row.seller_sku = normalized_sku
+    catalog_row.model = model
+    catalog_row.color = color
+    catalog_row.size = size
+    catalog_row.last_synced_at = utcnow()
+
+    if catalog_row.inventory_id:
+        inventory_row = session.get(
+            FullInventory,
+            catalog_row.inventory_id,
+        )
+        if inventory_row:
+            inventory_row.sku = normalized_sku
+            inventory_row.last_synced_at = utcnow()
+
+    update_sql = """
+        UPDATE order_items
+        SET seller_sku = :sku
+        WHERE external_item_id = :item_id
+    """
+    params: dict[str, Any] = {
+        "sku": normalized_sku,
+        "item_id": catalog_row.item_id,
+    }
+
+    if catalog_row.variation_id:
+        update_sql += " AND variation_id = :variation_id"
+        try:
+            params["variation_id"] = int(catalog_row.variation_id)
+        except (TypeError, ValueError):
+            params["variation_id"] = catalog_row.variation_id
+
+    session.execute(text(update_sql), params)
+
+
+async def repair_missing_skus(run_id: str) -> None:
+    if SessionLocal is None:
+        return
+
+    try:
+        with SessionLocal() as session:
+            run = session.get(MissingSkuRepairRun, run_id)
+            account = get_account(session)
+
+            if run is None or account is None:
+                return
+
+            run.status = "RUNNING"
+            run.started_at = utcnow()
+            run.last_error = None
+            session.commit()
+
+            pending_rows = session.scalars(
+                select(ProductCatalog).where(
+                    ProductCatalog.marketplace == "MERCADO_LIBRE",
+                    (
+                        ProductCatalog.seller_sku.is_(None)
+                        | (ProductCatalog.seller_sku == "")
+                    ),
+                )
+                .order_by(
+                    ProductCatalog.item_id,
+                    ProductCatalog.variation_id,
+                )
+            ).all()
+
+            run.total_pending = len(pending_rows)
+            session.commit()
+
+            item_cache: dict[str, dict[str, Any]] = {}
+
+            for catalog_row in pending_rows:
+                sku: str | None = None
+
+                if catalog_row.item_id not in item_cache:
+                    try:
+                        item_payload = await meli_get(
+                            (
+                                "https://api.mercadolibre.com/items/"
+                                f"{catalog_row.item_id}"
+                            ),
+                            account,
+                            session,
+                            params={"include_attributes": "all"},
+                        )
+                    except Exception:
+                        item_payload = {}
+
+                    item_cache[catalog_row.item_id] = item_payload
+                    await asyncio.sleep(0.25)
+
+                item_payload = item_cache[catalog_row.item_id]
+
+                if catalog_row.variation_id:
+                    variation_payload = next(
+                        (
+                            variation
+                            for variation in (
+                                item_payload.get("variations") or []
+                            )
+                            if str(variation.get("id") or "")
+                            == str(catalog_row.variation_id)
+                        ),
+                        None,
+                    )
+
+                    sku = extract_seller_sku_complete(
+                        variation_payload
+                    )
+
+                    if not sku:
+                        try:
+                            variation_detail = await meli_get(
+                                (
+                                    "https://api.mercadolibre.com/items/"
+                                    f"{catalog_row.item_id}/variations/"
+                                    f"{catalog_row.variation_id}"
+                                ),
+                                account,
+                                session,
+                                params={"include_attributes": "all"},
+                            )
+                            sku = extract_seller_sku_complete(
+                                variation_detail
+                            )
+                        except Exception:
+                            pass
+                else:
+                    sku = extract_seller_sku_complete(item_payload)
+
+                if sku:
+                    apply_resolved_sku(
+                        session,
+                        catalog_row,
+                        sku,
+                    )
+                    run.resolved += 1
+                else:
+                    run.unresolved += 1
+
+                run.processed += 1
+
+                if run.processed % 10 == 0:
+                    session.commit()
+
+                await asyncio.sleep(0.2)
+
+            run.status = "SUCCESS"
+            run.finished_at = utcnow()
+            session.commit()
+
+    except asyncio.CancelledError:
+        with SessionLocal() as session:
+            run = session.get(MissingSkuRepairRun, run_id)
+            if run:
+                run.status = "INTERRUPTED"
+                run.finished_at = utcnow()
+                run.last_error = (
+                    "La reparación fue interrumpida por un "
+                    "reinicio del servidor."
+                )
+                session.commit()
+        raise
+
+    except Exception as exc:
+        with SessionLocal() as session:
+            run = session.get(MissingSkuRepairRun, run_id)
+            if run:
+                run.status = "ERROR"
+                run.finished_at = utcnow()
+                run.last_error = str(exc)[:4000]
+                session.commit()
+
+    finally:
+        missing_sku_tasks.pop(run_id, None)
+
+
 def parse_sku_parts(sku: str | None) -> tuple[str | None, str | None, str | None]:
     if not sku:
         return None, None, None
@@ -2050,7 +2335,7 @@ async def automation_scheduler_loop() -> None:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "GETAC ERP API", "status": "online", "version": "1.1.2", "role": SERVICE_ROLE}
+    return {"service": "GETAC ERP API", "status": "online", "version": "1.2.0", "role": SERVICE_ROLE}
 
 
 @app.get("/health")
@@ -2061,7 +2346,7 @@ def health() -> dict[str, str]:
 def service_health() -> dict[str, object]:
     return {
         "status": "ok",
-        "version": "1.1.2",
+        "version": "1.2.0",
         "service_role": SERVICE_ROLE,
         "worker_enabled": SERVICE_ROLE in ("all", "worker"),
         "worker_running": bool(worker_task and not worker_task.done()),
@@ -2094,6 +2379,7 @@ def database_health() -> JSONResponse:
                     "automation_runs",
                     "product_catalog",
                     "full_inventory",
+                    "missing_sku_repair_runs",
                     "full_sync_runs",
                 ],
             }
@@ -3253,6 +3539,192 @@ def full_replenishment_rows(
     return result
 
 
+@app.post("/sync/mercadolibre/missing-skus")
+async def start_missing_sku_repair() -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    with SessionLocal() as session:
+        active_runs = session.scalars(
+            select(MissingSkuRepairRun).where(
+                MissingSkuRepairRun.status.in_(
+                    ["PENDING", "RUNNING"]
+                )
+            )
+        ).all()
+
+        for active in active_runs:
+            task = missing_sku_tasks.get(active.id)
+            if task is not None and not task.done():
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "status": "already_running",
+                        "run_id": active.id,
+                    },
+                )
+
+            active.status = "INTERRUPTED"
+            active.finished_at = utcnow()
+            active.last_error = (
+                "Ejecución anterior interrumpida por "
+                "reinicio del servidor."
+            )
+
+        session.commit()
+
+        run = MissingSkuRepairRun(
+            id=str(uuid.uuid4()),
+            status="PENDING",
+        )
+        session.add(run)
+        session.commit()
+        run_id = run.id
+
+    task = asyncio.create_task(repair_missing_skus(run_id))
+    missing_sku_tasks[run_id] = task
+
+    return JSONResponse(
+        status_code=202,
+        content={"status": "queued", "run_id": run_id},
+    )
+
+
+@app.get("/sync/mercadolibre/missing-skus/status")
+def missing_sku_repair_status() -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    with SessionLocal() as session:
+        run = session.scalar(
+            select(MissingSkuRepairRun)
+            .order_by(MissingSkuRepairRun.created_at.desc())
+            .limit(1)
+        )
+
+        if run is None:
+            return JSONResponse(content={"status": "NEVER_RUN"})
+
+        if run.status in ("PENDING", "RUNNING"):
+            task = missing_sku_tasks.get(run.id)
+            if task is None or task.done():
+                run.status = "INTERRUPTED"
+                run.finished_at = utcnow()
+                run.last_error = (
+                    "La reparación fue interrumpida por "
+                    "un reinicio del servidor."
+                )
+                session.commit()
+
+        progress = 0.0
+        if run.total_pending:
+            progress = round(
+                run.processed / run.total_pending * 100,
+                2,
+            )
+
+        return JSONResponse(content={
+            "run_id": run.id,
+            "status": run.status,
+            "total_pending": run.total_pending,
+            "processed": run.processed,
+            "resolved": run.resolved,
+            "unresolved": run.unresolved,
+            "progress_percent": progress,
+            "last_error": run.last_error,
+        })
+
+
+@app.get("/api/catalog/missing-skus")
+def list_missing_skus() -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(ProductCatalog).where(
+                ProductCatalog.marketplace == "MERCADO_LIBRE",
+                (
+                    ProductCatalog.seller_sku.is_(None)
+                    | (ProductCatalog.seller_sku == "")
+                ),
+            )
+            .order_by(
+                ProductCatalog.title,
+                ProductCatalog.item_id,
+                ProductCatalog.variation_id,
+            )
+        ).all()
+
+    return JSONResponse(content={
+        "total": len(rows),
+        "items": [
+            {
+                "id": row.id,
+                "item_id": row.item_id,
+                "variation_id": row.variation_id,
+                "inventory_id": row.inventory_id,
+                "title": row.title,
+                "category_id": row.category_id,
+                "attributes": (
+                    (row.raw_data or {}).get(
+                        "attribute_combinations"
+                    )
+                    or []
+                ),
+            }
+            for row in rows
+        ],
+    })
+
+
+@app.post("/api/catalog/missing-skus/{catalog_id}")
+async def save_missing_sku(
+    catalog_id: int,
+    request: Request,
+) -> JSONResponse:
+    if SessionLocal is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "database_not_configured"},
+        )
+
+    payload = await request.json()
+    sku = str(payload.get("sku") or "").strip().upper()
+
+    if not sku:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "sku_required"},
+        )
+
+    with SessionLocal() as session:
+        row = session.get(ProductCatalog, catalog_id)
+        if row is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "catalog_record_not_found"},
+            )
+
+        apply_resolved_sku(session, row, sku)
+        session.commit()
+
+    return JSONResponse(content={
+        "status": "saved",
+        "catalog_id": catalog_id,
+        "sku": sku,
+    })
+
+
 @app.post("/sync/mercadolibre/catalog")
 async def sync_catalog_endpoint() -> JSONResponse:
     try:
@@ -3776,6 +4248,144 @@ def download_full_shipment(
     )
 
 
+@app.get("/sku-pending", response_class=HTMLResponse)
+def sku_pending_page() -> HTMLResponse:
+    return HTMLResponse(content=r"""
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GETAC ERP — SKUs pendientes</title>
+<style>
+body{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,
+"Segoe UI",sans-serif;background:#f4f6f8;color:#17202a}
+.layout{display:grid;grid-template-columns:230px 1fr;min-height:100vh}
+.sidebar{background:#111827;color:#fff;padding:28px 20px}
+.brand{font-size:22px;font-weight:800;letter-spacing:.08em}
+.brand small{display:block;font-size:11px;opacity:.55;margin-top:4px}
+.nav{margin-top:32px;display:grid;gap:8px}
+.nav a{color:rgba(255,255,255,.72);text-decoration:none;
+padding:12px 14px;border-radius:10px;font-size:14px}
+.nav a.active{background:rgba(255,255,255,.12);color:#fff;font-weight:700}
+.main{padding:28px}.panel{background:#fff;border:1px solid #e6eaf0;
+border-radius:16px;padding:20px;box-shadow:0 10px 30px rgba(16,24,40,.06)}
+.top{display:flex;justify-content:space-between;gap:16px;
+align-items:center;flex-wrap:wrap;margin-bottom:18px}
+h1{margin:0}.sub{color:#667085;margin-top:5px}
+button{border:0;background:#111827;color:#fff;font-weight:700;
+padding:11px 16px;border-radius:10px;cursor:pointer}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:10px 8px;border-bottom:1px solid #e6eaf0;text-align:left}
+th{color:#667085;position:sticky;top:0;background:#fff}
+input{border:1px solid #d0d5dd;border-radius:8px;padding:8px;
+min-width:180px}.table-wrap{max-height:70vh;overflow:auto}
+.status{padding:12px;background:#f8fafc;border-radius:10px;
+margin-bottom:14px;color:#475467}
+.attributes{color:#667085;white-space:nowrap}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+<div class="brand">GETAC<small>ERP & ANALYTICS</small></div>
+<nav class="nav">
+<a href="/dashboard">Dashboard</a>
+<a href="/full">Inventario FULL</a>
+<a class="active" href="/sku-pending">SKUs pendientes</a>
+<a href="/automation">Automatizaciones</a>
+<a href="/docs">API</a>
+</nav>
+</aside>
+<main class="main">
+<div class="top">
+<div>
+<h1>Variantes sin SKU</h1>
+<div class="sub">Primero intenta recuperarlos automáticamente; captura
+manualmente solo los restantes.</div>
+</div>
+<button onclick="startRepair()">Buscar SKUs automáticamente</button>
+</div>
+<div id="status" class="status">Consultando…</div>
+<div class="panel">
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Producto</th><th>Item ID</th><th>Variation ID</th>
+<th>Inventory ID</th><th>Variante</th><th>SKU correcto</th><th></th>
+</tr>
+</thead>
+<tbody id="body"></tbody>
+</table>
+</div>
+</div>
+</main>
+</div>
+<script>
+function esc(v){return String(v??'').replaceAll('&','&amp;')
+.replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}
+function attributeText(items){
+return (items||[]).map(x=>`${x.name||x.id}: ${x.value_name||''}`)
+.join(' · ');
+}
+async function loadMissing(){
+const r=await fetch('/api/catalog/missing-skus',{cache:'no-store'});
+const d=await r.json();
+document.getElementById('status').textContent=
+`${d.total||0} variantes continúan sin SKU.`;
+document.getElementById('body').innerHTML=(d.items||[]).map(x=>`
+<tr>
+<td>${esc(x.title||'')}</td>
+<td>${esc(x.item_id)}</td>
+<td>${esc(x.variation_id)}</td>
+<td>${esc(x.inventory_id)}</td>
+<td class="attributes">${esc(attributeText(x.attributes))}</td>
+<td><input id="sku-${x.id}" placeholder="Ej. GT110-BLK-27"></td>
+<td><button onclick="saveSku(${x.id})">Guardar</button></td>
+</tr>`).join('');
+}
+async function saveSku(id){
+const input=document.getElementById('sku-'+id);
+const sku=input.value.trim().toUpperCase();
+if(!sku){alert('Escribe el SKU correcto.');return}
+const r=await fetch('/api/catalog/missing-skus/'+id,{
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({sku})
+});
+const d=await r.json();
+if(!r.ok){alert(d.error||'No se pudo guardar');return}
+loadMissing();
+}
+async function startRepair(){
+const r=await fetch('/sync/mercadolibre/missing-skus',{method:'POST'});
+if(!r.ok&&r.status!==409){
+const d=await r.json();alert(d.error||'No se pudo iniciar');return
+}
+pollRepair();
+}
+async function pollRepair(){
+const r=await fetch(
+'/sync/mercadolibre/missing-skus/status',
+{cache:'no-store'}
+);
+const d=await r.json();
+document.getElementById('status').textContent=
+`${d.status} · ${d.processed||0} de ${d.total_pending||0} · `+
+`${d.resolved||0} resueltos · ${d.unresolved||0} pendientes · `+
+`${d.progress_percent||0}%`+(d.last_error?' · '+d.last_error:'');
+if(['PENDING','RUNNING'].includes(d.status)){
+setTimeout(pollRepair,4000);
+}else if(d.status==='SUCCESS'){loadMissing()}
+}
+loadMissing();pollRepair();
+</script>
+</body>
+</html>
+""")
+
+
 @app.get("/full", response_class=HTMLResponse)
 def full_page() -> HTMLResponse:
     return HTMLResponse(content=r"""
@@ -3837,6 +4447,7 @@ border-radius:10px;margin-bottom:14px}
 <nav class="nav">
 <a href="/dashboard">Dashboard</a>
 <a class="active" href="/full">Inventario FULL</a>
+<a href="/sku-pending">SKUs pendientes</a>
 <a href="/automation">Automatizaciones</a>
 <a href="/docs">API y sincronización</a>
 </nav>

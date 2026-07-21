@@ -1,36 +1,42 @@
-# GETAC ERP v1.1.2 — Stock FULL real
+# GETAC ERP v1.2 — Corrección de variantes sin SKU
 
-## Lógica definitiva
+## Nueva sección
 
-Stock considerado:
+`/sku-pending`
 
-- Stock disponible FULL
-- Más stock en transferencia dentro de la red de Mercado Libre
+## Reparación automática
 
-No se toma en cuenta ingreso planeado.
+Consulta cada publicación y variación con:
 
-## Fórmula
+- `include_attributes=all`
+- atributo `SELLER_SKU`
+- detalle individual de la variación
 
-Cantidad sugerida:
+Cuando encuentra el SKU actualiza:
 
-Objetivo para 30 días menos:
+- `product_catalog`
+- `full_inventory`
+- `order_items` históricos del mismo item y variation_id
 
-Disponible + Transferencia
+## Corrección manual
 
-## Incluye
+Los registros que Mercado Libre no devuelve con SKU permanecen en la tabla
+de pendientes.
 
-- Transferencia automática desde `not_available_detail`
-- Cobertura recalculada con stock considerado
-- Excel usando disponible + transferencia
-- Correo de las 3:00 AM con la misma lógica
-- Prioridades ordenadas:
-  - CRITICO
-  - ALTO
-  - MEDIO
-  - OK
+Se muestra:
 
-## No incluye
+- Producto
+- Item ID
+- Variation ID
+- Inventory ID
+- Color/talla u otros atributos
 
-- Ingreso planeado
-- Captura manual
-- Tabla de planeados
+Solo se escribe el SKU correcto y se presiona Guardar.
+
+## Flujo
+
+1. Abrir `/sku-pending`
+2. Presionar `Buscar SKUs automáticamente`
+3. Esperar `SUCCESS`
+4. Completar manualmente únicamente los restantes
+5. Actualizar stock FULL
